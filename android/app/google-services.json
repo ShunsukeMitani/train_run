@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "871703895373",
+    "project_id": "train-run-389dd",
+    "storage_bucket": "train-run-389dd.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:871703895373:android:01f3339da93cd1e966eb04",
+        "android_client_info": {
+          "package_name": "com.example.train_run"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDl36627utjIfv4aY3dEfvj23ZGeXKRwR8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

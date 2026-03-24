@@ -1,0 +1,54 @@
+name: iOS Unsigned Build (for Sideloadly)
+
+on:
+  workflow_dispatch: # 手動実行用
+  push:
+    branches: [ "main" ] # mainブランチへのプッシュで実行
+
+jobs:
+  build-ios-unsigned:
+    runs-on: macos-latest # iOSビルドにはMac環境が必須
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1. Flutter SDKのセットアップ
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          # flutter-version: '3.19.0' # バージョン指定したい場合はコメントアウトを外す
+
+      # 2. 依存関係のインストール
+      - name: Install Dependencies
+        run: flutter pub get
+
+      # 3. CocoaPodsのインストール (iOSのライブラリ管理)
+      - name: Install Pods
+        run: |
+          cd ios
+          pod install --repo-update
+          cd ..
+
+      # 4. 署名なしで .app バンドルをビルド
+      # --no-codesign オプションが重要です
+      - name: Build iOS App (No Codesign)
+        run: |
+          flutter build ios --release --no-codesign
+
+      # 5. .app を .ipa 形式にパッケージング
+      # IPAの実体は "Payload" というフォルダの中に .app が入ったただのzipファイルです
+      - name: Package into IPA
+        run: |
+          mkdir Payload
+          # ビルドされた Runner.app を Payload フォルダに移動
+          mv build/ios/iphoneos/Runner.app Payload
+          # zip圧縮して .ipa にする (-r:再帰的, -y:シンボリックリンク保持)
+          zip -r -y app.ipa Payload
+
+      # 6. 生成されたIPAをGitHubにアップロード
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: train-run-app # ダウンロード時のファイル名
+          path: app.ipa
