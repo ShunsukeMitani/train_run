@@ -46,6 +46,10 @@ class _HomeScreenState extends State<HomeScreen> {
   Timer? _locationTimer;
   Timer? _exposureTimer;
   Timer? _penaltyTimer; 
+  
+  // ★追加: 画面のタイマーを1秒ごとに動かすためのタイマー
+  Timer? _uiTimer;
+  bool _isPassing = false; // 自動パス処理の重複実行を防ぐフラグ
 
   @override
   void initState() {
@@ -54,6 +58,23 @@ class _HomeScreenState extends State<HomeScreen> {
     if (widget.myRole == 'RUNNER') {
       _startExposureCheck();
     }
+
+    // ★追加: 1秒ごとに画面を更新してカウントダウンを動かす
+    _uiTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      setState(() {}); // 画面を更新
+
+      // ★追加：時間切れ自動パス処理
+      if (_gameData['mode'] == 'E' && (_gameData['settings_othelloTurnBased'] ?? false)) {
+        Timestamp? turnEndTs = _gameData['turnEndTime'];
+        if (turnEndTs != null) {
+          int remain = turnEndTs.toDate().difference(DateTime.now()).inSeconds;
+          if (remain <= 0) {
+            _forcePassTurn(); // 0秒になったら強制パスを実行！
+          }
+        }
+      }
+    });
   }
 
   @override
@@ -61,10 +82,42 @@ class _HomeScreenState extends State<HomeScreen> {
     _locationTimer?.cancel();
     _exposureTimer?.cancel();
     _penaltyTimer?.cancel();
+    _uiTimer?.cancel(); // ★追加: タイマー解除
     super.dispose();
   }
 
-  // ★駅名の表記揺れを吸収する正規化メソッド
+  // ★追加: 時間切れの時に強制的にターンを回す処理（トランザクションで安全に実行）
+  Future<void> _forcePassTurn() async {
+    if (_isPassing) return;
+    _isPassing = true;
+    try {
+      await FirebaseFirestore.instance.runTransaction((transaction) async {
+        DocumentReference gameRef = FirebaseFirestore.instance.collection('games').doc('game_001');
+        DocumentSnapshot snap = await transaction.get(gameRef);
+        if (!snap.exists) return;
+        
+        var data = snap.data() as Map<String, dynamic>;
+        Timestamp? ts = data['turnEndTime'];
+        
+        // 念のため、本当に時間が過ぎているか再確認
+        if (ts != null && ts.toDate().difference(DateTime.now()).inSeconds <= 0) {
+          String current = data['currentTurn'] ?? 'RED';
+          String next = current == 'RED' ? 'BLUE' : 'RED'; // 相手のチームに切り替え
+          int duration = data['turnDurationMinutes'] ?? 10;
+          
+          transaction.update(gameRef, {
+            'currentTurn': next,
+            'turnEndTime': Timestamp.fromDate(DateTime.now().add(Duration(minutes: duration))),
+          });
+        }
+      });
+    } catch (e) {
+      print("Turn pass error: $e");
+    } finally {
+      _isPassing = false;
+    }
+  }
+
   String _normalizeStationName(String name) {
     if (name == '難波' || name == '大阪難波' || name == 'ＪＲ難波' || name == '近鉄難波') return 'なんば';
     if (name == '三ノ宮' || name == '神戸三宮' || name == '阪神神戸三宮' || name == '阪急神戸三宮') return '三宮';
@@ -128,7 +181,6 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       if (_nearestStation == "---" || _nearestStation == "駅圏外") throw "駅の近くにいません。";
 
-      // 1. 路線選択 (自動 or 手動)
       List<String> possibleLines = [];
       if (allowedLines.isNotEmpty) {
         for (String line in allowedLines) {
@@ -168,14 +220,12 @@ class _HomeScreenState extends State<HomeScreen> {
         'currentLine': selectedLine,
       });
 
-      // 2. 駅許可チェック
       if (allowedStations.isNotEmpty) {
         String normalizedCurrent = _normalizeStationName(_nearestStation);
         bool isAllowed = allowedStations.any((s) => _normalizeStationName(s.toString()) == normalizedCurrent);
         if (!isAllowed) throw "この駅は許可されていません！";
       }
 
-      // 3. モード別処理
       if (mode == 'A') await _handleModeA(uid);
       else if (mode == 'B') await _handleModeB(uid);
       else if (mode == 'C') await _handleModeC(uid);
@@ -183,17 +233,17 @@ class _HomeScreenState extends State<HomeScreen> {
       else if (mode == 'E') await _handleModeE(uid);
       else if (mode == 'F') await _handleModeF(uid);
 
-      if (mode != 'E') { // Eは専用の完了メッセージを出すため除外
+      if (mode != 'E') {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("$_nearestStation ($selectedLine) にチェックイン！")));
       }
     } catch (e) {
       String err = e.toString();
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("エラー: $err"), backgroundColor: Colors.red));
       
-      // オセロのルール違反（挟めない）はペナルティ対象から外す
       bool isOthelloRuleError = err.contains("挟める相手の石がありません");
+      bool isTurnError = err.contains("ターンです"); // 相手のターンの時のエラーもペナルティから除外
       
-      if (penaltyEnabled && !isOthelloRuleError && (err.contains("許可されていません") || err.contains("含まれていません"))) {
+      if (penaltyEnabled && !isOthelloRuleError && !isTurnError && (err.contains("許可されていません") || err.contains("含まれていません"))) {
         await FirebaseFirestore.instance.collection('games').doc('game_001').collection('players').doc(uid).update({
           'penaltyUntil': Timestamp.fromDate(DateTime.now().add(const Duration(minutes: 5))),
         });
@@ -217,12 +267,10 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _handleModeC(String uid) async { await FirebaseFirestore.instance.collection('games').doc('game_001').collection('players').doc(uid).update({'isExposed': false, 'lastCheckInAt': FieldValue.serverTimestamp()}); }
   Future<void> _handleModeD(String uid) async { String myTeam = _myData['team'] ?? 'RED'; await FirebaseFirestore.instance.collection('games').doc('game_001').collection('claimed_stations').doc(_nearestStation).set({'name': _nearestStation, 'ownerTeam': myTeam, 'ownerUid': uid, 'claimedAt': FieldValue.serverTimestamp(), 'lat': _myData['location']['lat'], 'lng': _myData['location']['lng'], 'line': _currentLine}); }
   
-  // ★ Mode E: オセロ (神アップデート: OthelloLogic連動版)
   Future<void> _handleModeE(String uid) async { 
     String myTeam = _myData['team'] ?? 'RED'; 
     bool turnBased = _gameData['settings_othelloTurnBased'] ?? false; 
     
-    // ターンチェック
     if (turnBased) { 
       String currentTurn = _gameData['currentTurn'] ?? 'RED'; 
       if (currentTurn != myTeam) throw "現在は ${currentTurn} チームのターンです。"; 
@@ -233,7 +281,6 @@ class _HomeScreenState extends State<HomeScreen> {
     QueryDocumentSnapshot? targetDoc;
     String normalizedCurrent = _normalizeStationName(_nearestStation);
 
-    // 盤面から現在地の駅を探す
     for (var doc in allCells.docs) {
       if (_normalizeStationName(doc['station']) == normalizedCurrent) {
         targetDoc = doc;
@@ -250,10 +297,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
     int boardSize = _gameData['settings_boardSize'] ?? 8; 
 
-    // ★ OthelloLogicを呼び出して、挟み判定と盤面の更新を一気にやってもらう！
     bool success = await OthelloLogic.tryPlacePiece(targetDoc['station'], myTeam, boardSize);
 
-    // 1枚も挟めない場所だった場合は弾く
     if (!success) {
       throw "挟める相手の石がありません！ルールの範囲外です。";
     }
@@ -261,7 +306,6 @@ class _HomeScreenState extends State<HomeScreen> {
     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("石を置き、相手を裏返しました！"), backgroundColor: Colors.orange)); 
   }
   
-  // ★ Mode F: ビンゴ 
   Future<void> _handleModeF(String uid) async { 
     List<dynamic> card = _myData['bingoCard'] ?? []; 
     if (card.isEmpty) throw "ビンゴカードがありません。"; 
@@ -318,6 +362,28 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     String timerText = "${remaining.inMinutes}:${(remaining.inSeconds % 60).toString().padLeft(2, '0')}";
     return Container(color: Colors.red.withOpacity(0.95), width: double.infinity, height: double.infinity, child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [const Icon(Icons.block, color: Colors.white, size: 100), const SizedBox(height: 20), const Text("PENALTY", style: TextStyle(color: Colors.white, fontSize: 40, fontWeight: FontWeight.bold, letterSpacing: 5)), const SizedBox(height: 10), const Text("不正なチェックインを検知しました\nしばらく操作できません", style: TextStyle(color: Colors.white, fontSize: 16), textAlign: TextAlign.center), const SizedBox(height: 40), Text(timerText, style: const TextStyle(color: Colors.white, fontSize: 60, fontFamily: 'Courier', fontWeight: FontWeight.bold))]));
+  }
+
+  // ★追加: 画面上部に表示する、ターンと残り時間のバナー
+  Widget _buildTurnBanner() {
+    String currentTurn = _gameData['currentTurn'] ?? 'RED';
+    Timestamp? turnEndTs = _gameData['turnEndTime'];
+    int remaining = 0;
+    if (turnEndTs != null) {
+      remaining = turnEndTs.toDate().difference(DateTime.now()).inSeconds;
+      if (remaining < 0) remaining = 0;
+    }
+    
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      color: currentTurn == 'RED' ? Colors.redAccent : Colors.blueAccent,
+      child: Text(
+        "$currentTurn TEAM ターン  |  残り時間 ${remaining ~/ 60}:${(remaining % 60).toString().padLeft(2, '0')}",
+        textAlign: TextAlign.center,
+        style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 18, letterSpacing: 2),
+      ),
+    );
   }
 
   @override
@@ -378,6 +444,10 @@ class _HomeScreenState extends State<HomeScreen> {
                 children: [
                   Column(
                     children: [
+                      // ★追加: オセロのターン制モードがONならバナーを表示！
+                      if (mode == 'E' && (_gameData['settings_othelloTurnBased'] ?? false))
+                        _buildTurnBanner(),
+                        
                       _buildDashboard(mode, endTime),
                       Expanded(
                         child: Center(
@@ -435,7 +505,6 @@ class _HomeScreenState extends State<HomeScreen> {
       if (diff.isNegative) timeLeft = "FINISHED"; else timeLeft = "${diff.inHours}:${(diff.inMinutes % 60).toString().padLeft(2, '0')}";
     }
     String info = "";
-    if (mode == 'E' && (_gameData['settings_othelloTurnBased'] ?? false)) info = "\nTURN: ${_gameData['currentTurn']}";
     if (mode == 'F') info = "\nBINGO: ${_myData['bingoLines'] ?? 0} LINE"; 
 
     return Container(
