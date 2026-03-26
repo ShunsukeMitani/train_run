@@ -47,7 +47,6 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
   // ★追加: 駅名正規化メソッド (盤面生成時に統一する)
   String _normalizeStationName(String name) {
     if (name == '難波' || name == '大阪難波' || name == 'ＪＲ難波' || name == '近鉄難波') return 'なんば';
-
     return name;
   }
 
@@ -447,6 +446,59 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
     ); 
   }
 
+  // ★盤面シャッフル処理
+  Future<void> _shuffleOthelloBoard() async {
+    var snap = await FirebaseFirestore.instance.collection('games').doc('game_001').collection('othello_board').get();
+    
+    // まだ盤面が1度も作られていない場合はエラーメッセージを出す
+    if (snap.docs.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('まだ盤面が生成されていません。先に「開始」を押して盤面を作成してください。'), backgroundColor: Colors.redAccent));
+      }
+      return;
+    }
+
+    // 現在の駅リストを抽出してシャッフル
+    List<String> stations = snap.docs.map((d) => d.data()['station'] as String).toList();
+    stations.shuffle();
+
+    int boardSize = _boardSize.toInt(); // 現在の盤面サイズを適用
+    WriteBatch batch = FirebaseFirestore.instance.batch();
+    
+    int index = 0;
+    for (int y = 0; y < boardSize; y++) {
+      for (int x = 0; x < boardSize; x++) {
+        if (index < stations.length) {
+          String st = stations[index];
+          DocumentReference docRef = FirebaseFirestore.instance.collection('games').doc('game_001').collection('othello_board').doc('${x}_$y');
+          
+          // 中央マスをオセロの初期配置(赤・青)にセット、それ以外は空(null)にする
+          String? owner;
+          if (_othelloStandardInit) {
+            if (boardSize % 2 == 0) {
+              int center = boardSize ~/ 2;
+              if (x == center - 1 && y == center - 1) owner = 'RED';
+              else if (x == center && y == center - 1) owner = 'BLUE';
+              else if (x == center - 1 && y == center) owner = 'BLUE';
+              else if (x == center && y == center) owner = 'RED';
+            } else {
+              int center = boardSize ~/ 2;
+              if (x == center && y == center) owner = 'RED'; // 奇数サイズの場合はとりあえずRED
+            }
+          }
+
+          batch.update(docRef, {
+            'station': st,
+            'ownerTeam': owner,
+          });
+          index++;
+        }
+      }
+    }
+    await batch.commit();
+    if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('盤面の配置をシャッフルしました！', style: TextStyle(fontWeight: FontWeight.bold)), backgroundColor: Colors.orangeAccent));
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -503,6 +555,21 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
           const Divider(color: Colors.grey),
           
           const SizedBox(height: 20),
+          // ★追加: オセロモードの時だけ、開始ボタンの前にシャッフルボタンを表示
+          if (_selectedMode == 'E') ...[
+            ElevatedButton.icon(
+              icon: const Icon(Icons.shuffle),
+              label: const Text("対象駅はそのままに盤面だけシャッフル"),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.orangeAccent,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.all(15)
+              ),
+              onPressed: _shuffleOthelloBoard,
+            ),
+            const SizedBox(height: 10),
+          ],
+          
           ElevatedButton(style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent, padding: const EdgeInsets.all(15)), onPressed: _startGame, child: const Text("開始", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold))),
           if (_selectedMode == 'C') ...[const SizedBox(height: 20), ElevatedButton.icon(style: ElevatedButton.styleFrom(backgroundColor: Colors.orange[900], padding: const EdgeInsets.all(15)), icon: const Icon(Icons.flash_on), label: const Text("ミッション管理画面へ", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)), onPressed: () { Navigator.push(context, MaterialPageRoute(builder: (_) => const MissionScreen())); })],
           const SizedBox(height: 40),

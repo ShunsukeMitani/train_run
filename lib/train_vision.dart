@@ -36,6 +36,11 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
   bool _isSugorokuMode = false;
   int _boardSize = 8;
   
+  // ★追加：ターン制用の変数
+  bool _isTurnBased = false;
+  String _currentTurnTeam = "RED";
+  DateTime? _turnEndTime;
+
   String? _highlightedStation;
   List<String> _allowedStations = [];
 
@@ -44,23 +49,16 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
   bool _showResultScreen = false;
   
   Timer? _gameTimer;
-  int _remainingSeconds = 3600; 
+  int _remainingSeconds = 18000; // 5時間
 
   final FlutterLocalNotificationsPlugin _flutterLocalNotificationsPlugin = FlutterLocalNotificationsPlugin();
 
-  // ★修正箇所：会社名を自動で削り、全路線をネットワークとして繋ぎ合わせる
   String _normalizeStationName(String name) {
-    // 1. 巨大ターミナルの手動統一
     if (name == '難波' || name == '大阪難波' || name == 'ＪＲ難波' || name == '近鉄難波' || name == '南海なんば') return 'なんば';
     if (name == '大阪' || name == '大阪梅田' || name == '東梅田' || name == '西梅田') return '梅田';
     if (name == '三ノ宮' || name == '神戸三宮' || name == '阪神神戸三宮' || name == '阪急神戸三宮') return '三宮';
     if (name == '大阪阿部野橋') return '天王寺';
-
-    // 2. 会社名の接頭辞（プレフィックス）を自動削除
-    // 例: 山陽明石 -> 明石, 阪神尼崎 -> 尼崎, 近鉄奈良 -> 奈良, 京王八王子 -> 八王子
-    // これにより、会社が違っても物理的に同じ場所にある駅がグラフ上で繋がり、乗り換え可能になります！
     name = name.replaceAll(RegExp(r'^(ＪＲ|JR|山陽|京王|京急|京成|西武|東武|名鉄|近鉄|阪神|阪急|小田急|南海|西鉄)'), '');
-
     return name;
   }
 
@@ -160,7 +158,6 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
       '阪神': Color(0xFF1F64B1), '山陽電気': Color(0xFFD0101A), '山陽電鉄': Color(0xFFD0101A),
       '西鉄': Color(0xFF004EA2), 'ゆいレール': Color(0xFFE60012),
 
-
     };
     for (var key in colorMap.keys) if (name.contains(key)) return colorMap[key]!;
     return Colors.grey;
@@ -223,8 +220,6 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
     if (seconds == 1800) _sendNotification("残り時間のお知らせ", "残り30分です！");
     if (seconds == 600) _sendNotification("残り時間のお知らせ", "残り10分です！");
     if (seconds == 300) _sendNotification("残り時間のお知らせ", "残り5分です！");
-    if (seconds == 180) _sendNotification("残り時間のお知らせ", "残り3分です！");
-    if (seconds == 60) _sendNotification("残り時間のお知らせ", "残り1分です！");
   }
 
   Future<void> _sendNotification(String title, String content) async {
@@ -262,52 +257,65 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
   }
 
   Future<void> _fetchGameData() async {
-    var gameDoc = await FirebaseFirestore.instance.collection('games').doc('game_001').get();
-    if (!gameDoc.exists) return;
-    
-    var data = gameDoc.data()!;
-    List<dynamic> allowedLines = data['allowedLines'] ?? [];
-    List<dynamic> settingsStations = data['allowedStations'] ?? [];
-    String mode = data['mode'] ?? 'A';
-    int bSize = data['settings_boardSize'] ?? 8;
-
     var myDoc = await FirebaseFirestore.instance.collection('games').doc('game_001').collection('players').doc(FirebaseAuth.instance.currentUser!.uid).get();
     _currentLine = myDoc.data()?['currentLine'] ?? "";
 
-    for (String line in allowedLines) {
-      var stations = await TrainApiService.getStationsByLine(line);
-      _stationsCache[line] = stations;
-    }
-
-    Set<String> activeStations = {};
-    if (mode == 'E') {
-      var snap = await FirebaseFirestore.instance.collection('games').doc('game_001').collection('othello_board').get();
-      for (var d in snap.docs) activeStations.add(_normalizeStationName(d.data()['station']));
-    } else if (mode == 'F') {
-      List card = myDoc.data()?['bingoCard'] ?? [];
-      for (var c in card) activeStations.add(_normalizeStationName(c['station']));
-    } else {
-      activeStations.addAll(settingsStations.map((e) => _normalizeStationName(e.toString())));
-    }
-
-    if (mounted) {
+    // ★変更：リアルタイムでターン情報を受け取るためのリスナー
+    FirebaseFirestore.instance.collection('games').doc('game_001').snapshots().listen((doc) async {
+      if (!doc.exists || !mounted) return;
+      var data = doc.data()!;
+      
+      List<dynamic> allowedLines = data['allowedLines'] ?? [];
+      List<dynamic> settingsStations = data['allowedStations'] ?? [];
+      String mode = data['mode'] ?? 'A';
+      
       setState(() {
-        _lines = List<String>.from(allowedLines);
-        _allowedStations = activeStations.toList();
-        _isLoading = false;
-        
         _isJintoriMode = (mode == 'D');
         _isOthelloMode = (mode == 'E');
         _isBingoMode = (mode == 'F');
         _isSurvivalMode = (mode == 'C');
         _isSugorokuMode = (mode == 'B');
-        _boardSize = bSize;
+        _boardSize = data['settings_boardSize'] ?? 8;
         
-        int initialIndex = 0;
-        if (_lines.contains(_currentLine)) initialIndex = _lines.indexOf(_currentLine) + 1; 
-        _tabController = TabController(length: _lines.length + 1, vsync: this, initialIndex: initialIndex);
+        // ★追加：ターン制のデータ同期
+        _isTurnBased = data['othelloTurnBased'] ?? false;
+        _currentTurnTeam = data['currentTurn'] ?? 'RED';
+        if (data['turnEndTime'] != null) {
+          _turnEndTime = (data['turnEndTime'] as Timestamp).toDate();
+        }
       });
-    }
+
+      // 初回のみ駅データをキャッシュして構築
+      if (_lines.isEmpty) {
+        for (String line in allowedLines) {
+          var stations = await TrainApiService.getStationsByLine(line);
+          _stationsCache[line] = stations;
+        }
+        
+        Set<String> activeStations = {};
+        if (mode == 'E') {
+          var snap = await FirebaseFirestore.instance.collection('games').doc('game_001').collection('othello_board').get();
+          for (var d in snap.docs) activeStations.add(_normalizeStationName(d.data()['station']));
+        } else if (mode == 'F') {
+          List card = myDoc.data()?['bingoCard'] ?? [];
+          for (var c in card) activeStations.add(_normalizeStationName(c['station']));
+        } else {
+          activeStations.addAll(settingsStations.map((e) => _normalizeStationName(e.toString())));
+        }
+
+        if (mounted) {
+          setState(() {
+            _lines = List<String>.from(allowedLines);
+            _allowedStations = activeStations.toList();
+            _isLoading = false;
+            
+            int initialIndex = 0;
+            if (_lines.contains(_currentLine)) initialIndex = _lines.indexOf(_currentLine) + 1; 
+            _tabController = TabController(length: _lines.length + 1, vsync: this, initialIndex: initialIndex);
+          });
+        }
+      }
+    });
   }
 
   // --- 経路探索機能 ---
@@ -559,6 +567,26 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
     );
   }
 
+  // ★追加：ターン制のカウントダウンバナー
+  Widget _buildTurnBanner() {
+    int remaining = 0;
+    if (_turnEndTime != null) {
+      remaining = _turnEndTime!.difference(DateTime.now()).inSeconds;
+      if (remaining < 0) remaining = 0;
+    }
+    
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      color: _currentTurnTeam == 'RED' ? Colors.redAccent : Colors.blueAccent,
+      child: Text(
+        "$_currentTurnTeam TEAM ターン  |  残り ${remaining ~/ 60}:${(remaining % 60).toString().padLeft(2, '0')}",
+        textAlign: TextAlign.center,
+        style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16, letterSpacing: 2),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_isLoading) return const Scaffold(backgroundColor: Colors.white, body: Center(child: CircularProgressIndicator()));
@@ -606,15 +634,23 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
           ],
         ),
       ),
-      body: TabBarView(
-        controller: _tabController,
-        physics: const NeverScrollableScrollPhysics(),
+      body: Column(
         children: [
-          _buildSpecialTab(), 
-          ..._lines.map((line) {
-            if (line.contains("環状") || line.contains("山手")) return _buildLoopLineView(line);
-            else return _buildVerticalLineView(line);
-          }),
+          // ★追加：オセロモード＆ターン制ONの時だけタイマーを表示
+          if (_isOthelloMode && _isTurnBased) _buildTurnBanner(),
+          Expanded(
+            child: TabBarView(
+              controller: _tabController,
+              physics: const NeverScrollableScrollPhysics(),
+              children: [
+                _buildSpecialTab(), 
+                ..._lines.map((line) {
+                  if (line.contains("環状") || line.contains("山手")) return _buildLoopLineView(line);
+                  else return _buildVerticalLineView(line);
+                }),
+              ],
+            ),
+          ),
         ],
       ),
       floatingActionButton: FloatingActionButton.extended(
@@ -867,21 +903,39 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
       stream: FirebaseFirestore.instance.collection('games').doc('game_001').collection('players').snapshots(), 
       builder: (context, playerSnap) {
         return StreamBuilder<QuerySnapshot>(
-          stream: FirebaseFirestore.instance.collection('games').doc('game_001').collection('claimed_stations').snapshots(), 
+          stream: FirebaseFirestore.instance.collection('games').doc('game_001').collection('othello_board').snapshots(), 
           builder: (context, claimedSnap) {
-            Map<String, String> ownership = {}; if (claimedSnap.hasData) for (var doc in claimedSnap.data!.docs) ownership[doc['name']] = doc['ownerTeam'];
+            Map<String, String> ownership = {}; if (claimedSnap.hasData) for (var doc in claimedSnap.data!.docs) { if(doc.data().toString().contains('ownerTeam') && doc['ownerTeam'] != null) ownership[doc['station']] = doc['ownerTeam']; }
             Map<String, List<Map<String, dynamic>>> playerPos = {}; if (playerSnap.hasData) for (var doc in playerSnap.data!.docs) { var pd = doc.data() as Map<String, dynamic>; if (pd['currentStation'] != null) { if (playerPos[pd['currentStation']] == null) playerPos[pd['currentStation']] = []; playerPos[pd['currentStation']]!.add(pd); } }
 
             if (isLoop) {
               return LayoutBuilder(builder: (context, constraints) {
                 double centerX = constraints.maxWidth / 2; double centerY = constraints.maxHeight / 2; double radius = min(centerX, centerY) - 60;
                 return Stack(alignment: Alignment.center, children: [Text(lineName, style: TextStyle(color: lineColor.withOpacity(0.1), fontSize: 30, fontWeight: FontWeight.bold)), Container(width: radius * 2, height: radius * 2, decoration: BoxDecoration(shape: BoxShape.circle, border: Border.all(color: lineColor, width: 8))), ...List.generate(stations.length, (index) { 
-                  final station = stations[index]; String sName = station['name']; bool isValid = _allowedStations.isEmpty || _allowedStations.any((s) => _normalizeStationName(s) == _normalizeStationName(sName)); double angle = (2 * pi * index / stations.length) - (pi / 2); double x = centerX + radius * cos(angle); double y = centerY + radius * sin(angle); Color stationColor = isValid ? Colors.white : Colors.grey[200]!; Color borderColor = isValid ? Colors.black : Colors.grey[300]!; if (ownership[sName] == 'RED') stationColor = Colors.red; else if (ownership[sName] == 'BLUE') stationColor = Colors.blue; bool isHighlighted = (_normalizeStationName(sName) == _normalizeStationName(_highlightedStation ?? "")); Widget? playerIcon; if (playerPos.containsKey(sName)) { var p = playerPos[sName]!.first; Color pColor = Colors.grey; if (p['team'] == 'RED') pColor = Colors.red; if (p['team'] == 'BLUE') pColor = Colors.blue; playerIcon = Container(padding: const EdgeInsets.all(4), decoration: BoxDecoration(color: pColor, shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 2)), child: const Icon(Icons.train, color: Colors.white, size: 14)); } 
+                  final station = stations[index]; String sName = station['name']; bool isValid = _allowedStations.isEmpty || _allowedStations.any((s) => _normalizeStationName(s) == _normalizeStationName(sName)); double angle = (2 * pi * index / stations.length) - (pi / 2); double x = centerX + radius * cos(angle); double y = centerY + radius * sin(angle); Color stationColor = isValid ? Colors.white : Colors.grey[200]!; Color borderColor = isValid ? Colors.black : Colors.grey[300]!; if (ownership[sName] == 'RED') stationColor = Colors.red; else if (ownership[sName] == 'BLUE') stationColor = Colors.blue; bool isHighlighted = (_normalizeStationName(sName) == _normalizeStationName(_highlightedStation ?? "")); Widget? playerIcon; 
+                  
+                  if (playerPos.containsKey(sName)) { 
+                    var p = playerPos[sName]!.first; Color pColor = Colors.grey; IconData pIcon = Icons.train;
+                    if (p['team'] == 'RED') pColor = Colors.red; if (p['team'] == 'BLUE') pColor = Colors.blue;
+                    // ★変更：GM（デベロッパー）は金色の星アイコンに！
+                    if (p['role'] == 'GM' || p['role'] == 'developer' || p['role'] == 'ADMIN') { pColor = Colors.amber; pIcon = Icons.star; }
+                    playerIcon = Container(padding: const EdgeInsets.all(4), decoration: BoxDecoration(color: pColor, shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 2)), child: Icon(pIcon, color: Colors.white, size: 14)); 
+                  } 
                   return Positioned(left: x - 40, top: y - 20, child: SizedBox(width: 80, child: Column(children: [Stack(alignment: Alignment.topCenter, children: [playerIcon ?? Container(width: 16, height: 16, decoration: BoxDecoration(color: stationColor, shape: BoxShape.circle, border: Border.all(color: borderColor, width: 2))), if(isHighlighted) const Positioned(top: -20, child: Icon(Icons.push_pin, color: Colors.redAccent, size: 24))]), const SizedBox(height: 4), Container(padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2), decoration: BoxDecoration(color: isValid ? Colors.white.withOpacity(0.8) : Colors.transparent, borderRadius: BorderRadius.circular(4)), child: Text(sName, style: TextStyle(color: isValid ? Colors.black : Colors.grey[300], fontSize: 10, fontWeight: FontWeight.bold), textAlign: TextAlign.center))]))); })]);
               });
             } else {
               return ListView.builder(padding: const EdgeInsets.symmetric(vertical: 20), itemCount: stations.length, itemBuilder: (context, index) { 
-                final station = stations[index]; String sName = station['name']; bool isValid = _allowedStations.isEmpty || _allowedStations.any((s) => _normalizeStationName(s) == _normalizeStationName(sName)); Color dotColor = isValid ? Colors.white : Colors.grey[200]!; Color borderColor = isValid ? lineColor : Colors.grey[300]!; Color textColor = isValid ? Colors.black : Colors.grey[300]!; if (ownership[sName] == 'RED') dotColor = Colors.red; else if (ownership[sName] == 'BLUE') dotColor = Colors.blue; bool isHighlighted = (_normalizeStationName(sName) == _normalizeStationName(_highlightedStation ?? "")); List<Widget> icons = []; if (playerPos.containsKey(sName)) { for (var p in playerPos[sName]!) { Color tc = Colors.grey; if(p['team']=='RED') tc = Colors.red; if(p['team']=='BLUE') tc = Colors.blue; icons.add(Container(margin:const EdgeInsets.only(left:4), child: Icon(Icons.train, color: tc, size:20))); } } 
+                final station = stations[index]; String sName = station['name']; bool isValid = _allowedStations.isEmpty || _allowedStations.any((s) => _normalizeStationName(s) == _normalizeStationName(sName)); Color dotColor = isValid ? Colors.white : Colors.grey[200]!; Color borderColor = isValid ? lineColor : Colors.grey[300]!; Color textColor = isValid ? Colors.black : Colors.grey[300]!; if (ownership[sName] == 'RED') dotColor = Colors.red; else if (ownership[sName] == 'BLUE') dotColor = Colors.blue; bool isHighlighted = (_normalizeStationName(sName) == _normalizeStationName(_highlightedStation ?? "")); 
+                List<Widget> icons = []; 
+                if (playerPos.containsKey(sName)) { 
+                  for (var p in playerPos[sName]!) { 
+                    Color tc = Colors.grey; IconData ti = Icons.train;
+                    if(p['team']=='RED') tc = Colors.red; if(p['team']=='BLUE') tc = Colors.blue; 
+                    // ★変更：GM（デベロッパー）は金色の星アイコンに！
+                    if (p['role'] == 'GM' || p['role'] == 'developer' || p['role'] == 'ADMIN') { tc = Colors.amber; ti = Icons.star; }
+                    icons.add(Container(margin:const EdgeInsets.only(left:4), child: Icon(ti, color: tc, size:20))); 
+                  } 
+                } 
                 return SizedBox(height: 60, child: Row(children: [Expanded(flex: 4, child: Container(alignment: Alignment.centerRight, padding: const EdgeInsets.only(right: 16), child: Row(mainAxisAlignment: MainAxisAlignment.end, children: [if(isHighlighted) const Icon(Icons.push_pin, color: Colors.redAccent, size: 20), const SizedBox(width: 8), Text(sName, style: TextStyle(color: textColor, fontWeight: FontWeight.bold, fontSize: 16))]))), SizedBox(width: 40, child: Stack(alignment: Alignment.center, children: [Container(width: 10, color: borderColor, margin: EdgeInsets.only(top: index==0?30:0, bottom: index==stations.length-1?30:0)), Container(width: 18, height: 18, decoration: BoxDecoration(color: Colors.white, shape: BoxShape.circle, border: Border.all(color: borderColor, width: 4), boxShadow: [BoxShadow(color: dotColor == Colors.white ? Colors.transparent : dotColor, blurRadius: 5)]))])), Expanded(flex: 4, child: Row(children: icons))])); 
               });
             }
