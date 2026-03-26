@@ -27,6 +27,7 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
   double _boardSize = 5; 
   bool _othelloStandardInit = true; 
   bool _othelloTurnBased = false;
+  int _turnDurationMinutes = 10;
 
   String _selectedMode = 'A';
   final Map<String, String> _modeNames = {
@@ -44,7 +45,35 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
 
   final List<String> _regions = ["関東", "近畿", "中部", "九州", "東北", "中国", "四国", "北海道"];
 
-  // ★追加: 駅名正規化メソッド (盤面生成時に統一する)
+  @override
+  void initState() {
+    super.initState();
+    // ★追加: 設定画面を開いた時にFirebaseから現在の設定を読み込んで復元する
+    _loadCurrentSettings();
+  }
+
+  Future<void> _loadCurrentSettings() async {
+    try {
+      var doc = await FirebaseFirestore.instance.collection('games').doc('game_001').get();
+      if (doc.exists) {
+        var data = doc.data() as Map<String, dynamic>;
+        setState(() {
+          if (data['mode'] != null) _selectedMode = data['mode'];
+          if (data['settings_boardSize'] != null) _boardSize = (data['settings_boardSize'] as num).toDouble();
+          if (data['settings_othelloTurnBased'] != null) _othelloTurnBased = data['settings_othelloTurnBased'];
+          if (data['turnDurationMinutes'] != null) _turnDurationMinutes = data['turnDurationMinutes'];
+          if (data['settings_penaltyEnabled'] != null) _penaltyEnabled = data['settings_penaltyEnabled'];
+          if (data['settings_hunterVision'] != null) _hunterVision = data['settings_hunterVision'];
+          if (data['settings_allowSurrender'] != null) _allowSurrender = data['settings_allowSurrender'];
+          if (data['allowedLines'] != null) _allowedLines = List<String>.from(data['allowedLines']);
+          if (data['allowedStations'] != null) _allowedStations = List<String>.from(data['allowedStations']);
+        });
+      }
+    } catch (e) {
+      print("Error loading settings: $e");
+    }
+  }
+
   String _normalizeStationName(String name) {
     if (name == '難波' || name == '大阪難波' || name == 'ＪＲ難波' || name == '近鉄難波') return 'なんば';
     return name;
@@ -65,6 +94,73 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
     );
   }
 
+  // ★超重要：各路線から最低1駅を確実にピックアップし、全体をバランスよくシャッフルする神アルゴリズム
+  Future<List<String>> _getBalancedStationList(int requiredCount) async {
+    Map<String, List<String>> lineStations = {};
+    Set<String> validStationsSet = _allowedStations.isNotEmpty 
+        ? _allowedStations.map((s) => _normalizeStationName(s)).toSet() 
+        : {};
+
+    // まず各路線の対象駅をまとめる
+    for (String l in _allowedLines) {
+      var sList = await TrainApiService.getStationsByLine(l);
+      List<String> validForLine = [];
+      for (var s in sList) {
+        String sName = _normalizeStationName(s['name']);
+        if (validStationsSet.isEmpty || validStationsSet.contains(sName)) {
+          validForLine.add(sName);
+        }
+      }
+      // 同じ駅が路線内にダブって入らないよう排除
+      validForLine = validForLine.toSet().toList();
+      if (validForLine.isNotEmpty) {
+        lineStations[l] = validForLine;
+      }
+    }
+
+    Set<String> selectedSet = {};
+    List<String> remaining = [];
+
+    // 1. 【対象駅が0になる路線を防ぐ】各路線から最低1つずつ選ぶ
+    for (String l in lineStations.keys) {
+      var list = lineStations[l]!;
+      list.shuffle();
+      for(String s in list) {
+        // すでに他路線の乗換駅として選ばれていないかチェック
+        if(!selectedSet.contains(s)) {
+          selectedSet.add(s);
+          break;
+        }
+      }
+    }
+
+    // 2. 残りの駅を全部ひとまとめにする
+    for (String l in lineStations.keys) {
+      for(String s in lineStations[l]!) {
+        if (!selectedSet.contains(s) && !remaining.contains(s)) {
+          remaining.add(s);
+        }
+      }
+    }
+
+    List<String> selected = selectedSet.toList();
+
+    // 3. 盤面のマス目に足りない分を、残りの駅の中からランダムに補充する
+    remaining.shuffle();
+    int needed = requiredCount - selected.length;
+    if (needed > 0) {
+      selected.addAll(remaining.take(needed));
+    } else if (needed < 0) {
+      // 万が一「選んだ路線の数」が「盤面のマス目」より多い場合は、泣く泣く路線を削る
+      selected.shuffle();
+      selected = selected.take(requiredCount).toList();
+    }
+
+    // 4. 最後に全体をシャッフル（どの路線の駅が盤面のどこに配置されるか分からなくする）
+    selected.shuffle();
+    return selected;
+  }
+
   void _startGame() async {
     String? oddWinner;
     if (_selectedMode == 'E' && _othelloStandardInit && _boardSize.toInt() % 2 != 0) {
@@ -83,7 +179,11 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
       areaData = _gameAreaPoints!.map((p) => {'lat': p.latitude, 'lng': p.longitude}).toList();
     }
 
-    // 設定保存
+    Timestamp? firstTurnEndTime;
+    if (_selectedMode == 'E' && _othelloTurnBased) {
+      firstTurnEndTime = Timestamp.fromDate(start.add(Duration(minutes: _turnDurationMinutes)));
+    }
+
     await FirebaseFirestore.instance.collection('games').doc('game_001').update(
       {
         'startTime': Timestamp.fromDate(start),
@@ -92,10 +192,7 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
         'mode': _selectedMode,
         'areaPoints': areaData ?? [],
         'allowedLines': _allowedLines,
-        
-        // ★許可駅リストも正規化して保存
         'allowedStations': _allowedStations.map((s) => _normalizeStationName(s)).toSet().toList(),
-        
         'settings_moneyRate': double.tryParse(_moneyCtrl.text) ?? 100.0,
         'settings_updateInterval': int.tryParse(_intervalCtrl.text) ?? 5,
         'settings_hunterVision': _hunterVision,
@@ -105,7 +202,9 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
         'settings_reversi': (_selectedMode == 'E'), 
         'settings_boardSize': _boardSize.toInt(),
         'settings_othelloTurnBased': _othelloTurnBased,
+        'turnDurationMinutes': _turnDurationMinutes,
         'currentTurn': 'RED',
+        'turnEndTime': firstTurnEndTime,
         'bingoCompleteCount': 0,
       },
     );
@@ -133,24 +232,14 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
     if (mounted) Navigator.pop(context);
   }
 
-  // ★ Mode F: ビンゴカード生成 (正規化対応)
   Future<void> _generateBingoCardsForEveryone() async {
-    Set<String> allStations = {};
-    
-    if (_allowedStations.isNotEmpty) {
-      allStations.addAll(_allowedStations.map((s) => _normalizeStationName(s)));
-    } else {
-      for (String line in _allowedLines) {
-        var stations = await TrainApiService.getStationsByLine(line);
-        // ここで正規化してSetに追加 (重複排除)
-        for (var s in stations) allStations.add(_normalizeStationName(s['name']));
-      }
-    }
-    
     int size = _boardSize.toInt();
     int totalCells = size * size;
     
-    if (allStations.length < totalCells) {
+    // ★変更: ビンゴも全路線から満遍なくピックアップしたリストを使う
+    List<String> balancedStations = await _getBalancedStationList(totalCells);
+
+    if (balancedStations.length < totalCells) {
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("駅数が足りないためFREEマスが含まれます"), backgroundColor: Colors.orange));
     }
 
@@ -158,59 +247,40 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
     var batch = FirebaseFirestore.instance.batch();
 
     for (var player in players.docs) {
-      List<String> stationList = allStations.toList()..shuffle();
+      // プレイヤーごとに配置をシャッフル
+      List<String> stationList = List.from(balancedStations)..shuffle();
       List<Map<String, dynamic>> cardData = [];
       
       for (int i = 0; i < totalCells; i++) {
         String name = "FREE";
         bool isOpen = false;
-        
         if (size % 2 != 0 && i == (totalCells ~/ 2)) {
-          name = "FREE";
-          isOpen = true; 
+          name = "FREE"; isOpen = true; 
         } else if (i < stationList.length) {
           name = stationList[i];
         } else {
-          name = "FREE"; 
-          isOpen = true;
+          name = "FREE"; isOpen = true;
         }
-
-        cardData.add({
-          'index': i,
-          'station': name,
-          'isOpen': isOpen,
-        });
+        cardData.add({'index': i, 'station': name, 'isOpen': isOpen});
       }
-      
-      batch.update(player.reference, {
-        'bingoCard': cardData,
-        'bingoLines': 0,
-        'bingoRank': 0,
-      });
+      batch.update(player.reference, {'bingoCard': cardData, 'bingoLines': 0, 'bingoRank': 0});
     }
     await batch.commit();
   }
 
-  // ★ Mode E: オセロ盤面生成 (正規化対応)
   Future<void> _generateOthelloBoard([String? oddWinner]) async {
-    Set<String> allStations = {};
-    if (_allowedStations.isNotEmpty) {
-      allStations.addAll(_allowedStations.map((s) => _normalizeStationName(s)));
-    } else {
-      for (String l in _allowedLines) { 
-        var s = await TrainApiService.getStationsByLine(l); 
-        for (var i in s) allStations.add(_normalizeStationName(i['name'])); 
-      }
-    }
+    int size = _boardSize.toInt();
+    int totalCells = size * size;
     
-    List<String> stationList = allStations.toList()..shuffle();
+    // ★変更: バランス保証付きの神シャッフルアルゴリズムで駅を取得
+    List<String> stationList = await _getBalancedStationList(totalCells);
+
     var batch = FirebaseFirestore.instance.batch();
     var boardRef = FirebaseFirestore.instance.collection('games').doc('game_001').collection('othello_board');
     
     var oldDocs = await boardRef.get(); 
     for(var d in oldDocs.docs) batch.delete(d.reference);
 
-    int size = _boardSize.toInt();
     int center = size ~/ 2; 
     int stationIndex = 0;
 
@@ -218,8 +288,7 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
       for (int x = 0; x < size; x++) {
         String stationName = "FREE"; 
         if (stationIndex < stationList.length) { 
-          stationName = stationList[stationIndex]; 
-          stationIndex++; 
+          stationName = stationList[stationIndex]; stationIndex++; 
         }
         
         String docId = "${x}_$y";
@@ -298,25 +367,9 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
         content: Column(
           mainAxisSize: MainAxisSize.min, 
           children: [
-            ListTile(
-              leading: const Icon(Icons.my_location, color: Colors.blueAccent), 
-              title: const Text("現在地周辺", style: TextStyle(color: Colors.white)), 
-              onTap: () { Navigator.pop(ctx); _searchLines(null); }
-            ), 
-            ListTile(
-              leading: const Icon(Icons.map, color: Colors.greenAccent), 
-              title: const Text("地図指定", style: TextStyle(color: Colors.white)), 
-              onTap: () async { 
-                Navigator.pop(ctx); 
-                final res = await Navigator.push(context, MaterialPageRoute(builder: (c) => const MapScreen(myRole: 'GM', myName: 'GM', initialMode: 'SELECT_LOCATION'))); 
-                if (res!=null) _searchLines(res); 
-              }
-            ), 
-            ListTile(
-              leading: const Icon(Icons.public, color: Colors.orangeAccent), 
-              title: const Text("地域選択", style: TextStyle(color: Colors.white)), 
-              onTap: () { Navigator.pop(ctx); _showRegionSelectDialog(); }
-            )
+            ListTile(leading: const Icon(Icons.my_location, color: Colors.blueAccent), title: const Text("現在地周辺", style: TextStyle(color: Colors.white)), onTap: () { Navigator.pop(ctx); _searchLines(null); }), 
+            ListTile(leading: const Icon(Icons.map, color: Colors.greenAccent), title: const Text("地図指定", style: TextStyle(color: Colors.white)), onTap: () async { Navigator.pop(ctx); final res = await Navigator.push(context, MaterialPageRoute(builder: (c) => const MapScreen(myRole: 'GM', myName: 'GM', initialMode: 'SELECT_LOCATION'))); if (res!=null) _searchLines(res); }), 
+            ListTile(leading: const Icon(Icons.public, color: Colors.orangeAccent), title: const Text("地域選択", style: TextStyle(color: Colors.white)), onTap: () { Navigator.pop(ctx); _showRegionSelectDialog(); })
           ]
         )
       )
@@ -324,179 +377,82 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
   }
 
   void _showRegionSelectDialog() { 
-    showDialog(
-      context: context, 
-      builder: (ctx) => AlertDialog(
-        backgroundColor: Colors.grey[900], 
-        content: SizedBox(
-          width: double.maxFinite, 
-          height: 300, 
-          child: ListView.builder(
-            itemCount: _regions.length, 
-            itemBuilder: (c, i) => ListTile(
-              title: Text(_regions[i], style: const TextStyle(color: Colors.white)), 
-              onTap: () { Navigator.pop(ctx); _searchLinesByRegion(_regions[i]); }
-            )
-          )
-        )
-      )
-    ); 
+    showDialog(context: context, builder: (ctx) => AlertDialog(backgroundColor: Colors.grey[900], content: SizedBox(width: double.maxFinite, height: 300, child: ListView.builder(itemCount: _regions.length, itemBuilder: (c, i) => ListTile(title: Text(_regions[i], style: const TextStyle(color: Colors.white)), onTap: () { Navigator.pop(ctx); _searchLinesByRegion(_regions[i]); }))))); 
   }
 
   Future<void> _searchLinesByRegion(String r) async { 
     showDialog(context: context, barrierDismissible: false, builder: (_) => const Center(child: CircularProgressIndicator())); 
-    try { 
-      var l = await TrainApiService.getLinesByRegion(r); 
-      if(mounted) Navigator.pop(context); 
-      if(mounted) _showMultiSelectDialog(l, r); 
-    } catch(e) { 
-      if(mounted) Navigator.pop(context); 
-    } 
+    try { var l = await TrainApiService.getLinesByRegion(r); if(mounted) Navigator.pop(context); if(mounted) _showMultiSelectDialog(l, r); } catch(e) { if(mounted) Navigator.pop(context); } 
   }
 
   Future<void> _searchLines(LatLng? p) async { 
     showDialog(context: context, barrierDismissible: false, builder: (_) => const Center(child: CircularProgressIndicator())); 
-    try { 
-      LatLng t;
-      if (p != null) {
-        t = p;
-      } else {
-        Position pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
-        t = LatLng(pos.latitude, pos.longitude);
-      }
-      var l = await TrainApiService.getLinesInArea(t); 
-      if(mounted) Navigator.pop(context); 
-      if(mounted) _showMultiSelectDialog(l, "周辺"); 
-    } catch(e) { 
-      if(mounted) Navigator.pop(context); 
-    } 
+    try { LatLng t; if (p != null) { t = p; } else { Position pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high); t = LatLng(pos.latitude, pos.longitude); } var l = await TrainApiService.getLinesInArea(t); if(mounted) Navigator.pop(context); if(mounted) _showMultiSelectDialog(l, "周辺"); } catch(e) { if(mounted) Navigator.pop(context); } 
   }
 
   void _showMultiSelectDialog(List<String> lines, String title) { 
-    showDialog(
-      context: context, 
-      builder: (ctx) => AlertDialog(
-        backgroundColor: Colors.grey[900], 
-        title: Text(title, style: const TextStyle(color: Colors.white)), 
-        content: SizedBox(
-          width: double.maxFinite, 
-          height: 400, 
-          child: StatefulBuilder(
-            builder: (ctx, ss) => ListView.builder(
-              itemCount: lines.length, 
-              itemBuilder: (c, i) => CheckboxListTile(
-                title: Text(lines[i], style: const TextStyle(color: Colors.white)), 
-                value: _allowedLines.contains(lines[i]), 
-                onChanged: (v) { 
-                  ss(() { 
-                    if(v!) { _allowedLines.add(lines[i]); _addAllStationsDefault(lines[i]); } 
-                    else { _allowedLines.remove(lines[i]); } 
-                  }); 
-                  setState((){}); 
-                }
-              )
-            )
-          )
-        ), 
-        actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("完了", style: TextStyle(color: Colors.greenAccent)))]
-      )
-    ); 
+    showDialog(context: context, builder: (ctx) => AlertDialog(backgroundColor: Colors.grey[900], title: Text(title, style: const TextStyle(color: Colors.white)), content: SizedBox(width: double.maxFinite, height: 400, child: StatefulBuilder(builder: (ctx, ss) => ListView.builder(itemCount: lines.length, itemBuilder: (c, i) => CheckboxListTile(title: Text(lines[i], style: const TextStyle(color: Colors.white)), value: _allowedLines.contains(lines[i]), onChanged: (v) { ss(() { if(v!) { _allowedLines.add(lines[i]); _addAllStationsDefault(lines[i]); } else { _allowedLines.remove(lines[i]); } }); setState((){}); })))), actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("完了", style: TextStyle(color: Colors.greenAccent)))])); 
   }
 
-  Future<void> _addAllStationsDefault(String l) async { 
-    var s = await TrainApiService.getStationsByLine(l); 
-    for(var i in s) if(!_allowedStations.contains(i['name'])) setState(() => _allowedStations.add(i['name'])); 
-  }
+  Future<void> _addAllStationsDefault(String l) async { var s = await TrainApiService.getStationsByLine(l); for(var i in s) if(!_allowedStations.contains(i['name'])) setState(() => _allowedStations.add(i['name'])); }
 
   Future<void> _showStationSelectDialog() async { 
     if(_allowedLines.isEmpty) return; 
     showDialog(context: context, barrierDismissible: false, builder: (_) => const Center(child: CircularProgressIndicator())); 
-    Map<String, List<String>> m = {}; 
-    for(var l in _allowedLines) { 
-      var s = await TrainApiService.getStationsByLine(l); 
-      m[l] = s.map((e)=>e['name'] as String).toList(); 
-    } 
+    Map<String, List<String>> m = {}; for(var l in _allowedLines) { var s = await TrainApiService.getStationsByLine(l); m[l] = s.map((e)=>e['name'] as String).toList(); } 
     if(mounted) Navigator.pop(context); 
-    if(mounted) showDialog(
-      context: context, 
-      builder: (ctx) => AlertDialog(
-        backgroundColor: Colors.grey[900], 
-        content: SizedBox(
-          width: double.maxFinite, 
-          height: 500, 
-          child: StatefulBuilder(
-            builder: (ctx, ss) => ListView.builder(
-              itemCount: _allowedLines.length, 
-              itemBuilder: (c, i) => ExpansionTile(
-                title: Text(_allowedLines[i], style: const TextStyle(color: Colors.green)), 
-                children: m[_allowedLines[i]]!.map((s) => CheckboxListTile(
-                  title: Text(s, style: const TextStyle(color: Colors.white)), 
-                  value: _allowedStations.contains(s), 
-                  onChanged: (v) { 
-                    ss(() { if(v!) _allowedStations.add(s); else _allowedStations.remove(s); }); 
-                    setState((){}); 
-                  }
-                )).toList()
-              )
-            )
-          )
-        ), 
-        actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("完了", style: TextStyle(color: Colors.blueAccent)))]
-      )
-    ); 
+    if(mounted) showDialog(context: context, builder: (ctx) => AlertDialog(backgroundColor: Colors.grey[900], content: SizedBox(width: double.maxFinite, height: 500, child: StatefulBuilder(builder: (ctx, ss) => ListView.builder(itemCount: _allowedLines.length, itemBuilder: (c, i) => ExpansionTile(title: Text(_allowedLines[i], style: const TextStyle(color: Colors.green)), children: m[_allowedLines[i]]!.map((s) => CheckboxListTile(title: Text(s, style: const TextStyle(color: Colors.white)), value: _allowedStations.contains(s), onChanged: (v) { ss(() { if(v!) _allowedStations.add(s); else _allowedStations.remove(s); }); setState((){}); })).toList())))), actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("完了", style: TextStyle(color: Colors.blueAccent)))])); 
   }
 
-  // ★盤面シャッフル処理
+  // ★修正: 対象駅すべてからバランス良くシャッフルして再構成する
   Future<void> _shuffleOthelloBoard() async {
-    var snap = await FirebaseFirestore.instance.collection('games').doc('game_001').collection('othello_board').get();
-    
-    // まだ盤面が1度も作られていない場合はエラーメッセージを出す
-    if (snap.docs.isEmpty) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('まだ盤面が生成されていません。先に「開始」を押して盤面を作成してください。'), backgroundColor: Colors.redAccent));
-      }
+    if (_allowedLines.isEmpty) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('対象路線が設定されていません。'), backgroundColor: Colors.redAccent));
       return;
     }
 
-    // 現在の駅リストを抽出してシャッフル
-    List<String> stations = snap.docs.map((d) => d.data()['station'] as String).toList();
-    stations.shuffle();
+    int boardSize = _boardSize.toInt(); 
+    int totalCells = boardSize * boardSize;
 
-    int boardSize = _boardSize.toInt(); // 現在の盤面サイズを適用
+    // 神シャッフルアルゴリズムで新しく対象駅全体からピックアップ
+    List<String> stationList = await _getBalancedStationList(totalCells);
+
     WriteBatch batch = FirebaseFirestore.instance.batch();
+    var boardRef = FirebaseFirestore.instance.collection('games').doc('game_001').collection('othello_board');
     
-    int index = 0;
+    var oldDocs = await boardRef.get(); 
+    for(var d in oldDocs.docs) batch.delete(d.reference);
+
+    int center = boardSize ~/ 2; 
+    int stationIndex = 0;
+
     for (int y = 0; y < boardSize; y++) {
       for (int x = 0; x < boardSize; x++) {
-        if (index < stations.length) {
-          String st = stations[index];
-          DocumentReference docRef = FirebaseFirestore.instance.collection('games').doc('game_001').collection('othello_board').doc('${x}_$y');
-          
-          // 中央マスをオセロの初期配置(赤・青)にセット、それ以外は空(null)にする
-          String? owner;
-          if (_othelloStandardInit) {
-            if (boardSize % 2 == 0) {
-              int center = boardSize ~/ 2;
-              if (x == center - 1 && y == center - 1) owner = 'RED';
-              else if (x == center && y == center - 1) owner = 'BLUE';
-              else if (x == center - 1 && y == center) owner = 'BLUE';
-              else if (x == center && y == center) owner = 'RED';
-            } else {
-              int center = boardSize ~/ 2;
-              if (x == center && y == center) owner = 'RED'; // 奇数サイズの場合はとりあえずRED
-            }
-          }
-
-          batch.update(docRef, {
-            'station': st,
-            'ownerTeam': owner,
-          });
-          index++;
+        String stationName = "FREE"; 
+        if (stationIndex < stationList.length) { 
+          stationName = stationList[stationIndex]; 
+          stationIndex++; 
         }
+        
+        String docId = "${x}_$y";
+        String? initialOwner;
+        
+        if (_othelloStandardInit) {
+          if (boardSize % 2 == 0) {
+            if (x == center - 1 && y == center - 1) initialOwner = 'RED';
+            else if (x == center && y == center - 1) initialOwner = 'BLUE';
+            else if (x == center - 1 && y == center) initialOwner = 'BLUE';
+            else if (x == center && y == center) initialOwner = 'RED';
+          } else {
+            if (x == center && y == center) initialOwner = 'RED'; 
+          }
+        }
+
+        batch.set(boardRef.doc(docId), {'x': x, 'y': y, 'station': stationName, 'ownerTeam': initialOwner});
       }
     }
     await batch.commit();
-    if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('盤面の配置をシャッフルしました！', style: TextStyle(fontWeight: FontWeight.bold)), backgroundColor: Colors.orangeAccent));
+    if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('対象駅全体から盤面をシャッフルしました！', style: TextStyle(fontWeight: FontWeight.bold)), backgroundColor: Colors.orangeAccent));
   }
 
   @override
@@ -532,6 +488,24 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
             if (_selectedMode == 'E') ...[
               SwitchListTile(title: const Text("初期配置 (中央の石)", style: TextStyle(color: Colors.white)), subtitle: Text(_othelloStandardInit ? "あり" : "なし", style: const TextStyle(color: Colors.grey, fontSize: 12)), value: _othelloStandardInit, activeColor: Colors.cyanAccent, onChanged: (v) => setState(() => _othelloStandardInit = v)),
               SwitchListTile(title: const Text("ターン制モード", style: TextStyle(color: Colors.white)), subtitle: Text(_othelloTurnBased ? "ON" : "OFF", style: const TextStyle(color: Colors.grey, fontSize: 12)), value: _othelloTurnBased, activeColor: Colors.purpleAccent, onChanged: (v) => setState(() => _othelloTurnBased = v)),
+              
+              if (_othelloTurnBased)
+                ListTile(
+                  title: const Text("  ▶ 1ターンの制限時間", style: TextStyle(color: Colors.white70)),
+                  trailing: DropdownButton<int>(
+                    value: _turnDurationMinutes,
+                    dropdownColor: Colors.grey[800],
+                    style: const TextStyle(color: Colors.purpleAccent, fontWeight: FontWeight.bold, fontSize: 16),
+                    underline: const SizedBox(),
+                    items: const [
+                      DropdownMenuItem(value: 5, child: Text("5分")),
+                      DropdownMenuItem(value: 10, child: Text("10分")),
+                      DropdownMenuItem(value: 15, child: Text("15分")),
+                      DropdownMenuItem(value: 30, child: Text("30分")),
+                    ],
+                    onChanged: (v) => setState(() => _turnDurationMinutes = v!),
+                  ),
+                ),
             ] else ...[
               const Text("※ゲーム開始時に全員にランダムなカードが配布されます", style: TextStyle(color: Colors.grey, fontSize: 12)),
             ],
@@ -555,16 +529,11 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
           const Divider(color: Colors.grey),
           
           const SizedBox(height: 20),
-          // ★追加: オセロモードの時だけ、開始ボタンの前にシャッフルボタンを表示
           if (_selectedMode == 'E') ...[
             ElevatedButton.icon(
               icon: const Icon(Icons.shuffle),
-              label: const Text("対象駅はそのままに盤面だけシャッフル"),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.orangeAccent,
-                foregroundColor: Colors.white,
-                padding: const EdgeInsets.all(15)
-              ),
+              label: const Text("対象駅全てから盤面をシャッフル"),
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.orangeAccent, foregroundColor: Colors.white, padding: const EdgeInsets.all(15)),
               onPressed: _shuffleOthelloBoard,
             ),
             const SizedBox(height: 10),

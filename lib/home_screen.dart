@@ -14,6 +14,7 @@ import 'mail_screen.dart';
 import 'discord_screen.dart';
 import 'train_vision.dart'; 
 import 'dice_dialog.dart'; 
+import 'othello_logic.dart'; // ★追加: オセロの判定ロジックを読み込む
 
 class HomeScreen extends StatefulWidget {
   final String myRole;
@@ -63,23 +64,12 @@ class _HomeScreenState extends State<HomeScreen> {
     super.dispose();
   }
 
-  // ★追加: 駅名の表記揺れを吸収する正規化メソッド
+  // ★駅名の表記揺れを吸収する正規化メソッド
   String _normalizeStationName(String name) {
-    // 難波エリアの統合
-    if (name == '難波' || name == '大阪難波' || name == 'ＪＲ難波' || name == '近鉄難波') {
-      return 'なんば';
-    }
-    // 三宮エリアの統合
-    if (name == '三ノ宮' || name == '神戸三宮' || name == '阪神神戸三宮' || name == '阪急神戸三宮') {
-      return '三宮';
-    }
-    // 梅田エリアの統合
-    if (name == '大阪' || name == '大阪梅田' || name == '東梅田' || name == '西梅田') {
-      return '梅田';
-    }
-    // 天王寺エリア
+    if (name == '難波' || name == '大阪難波' || name == 'ＪＲ難波' || name == '近鉄難波') return 'なんば';
+    if (name == '三ノ宮' || name == '神戸三宮' || name == '阪神神戸三宮' || name == '阪急神戸三宮') return '三宮';
+    if (name == '大阪' || name == '大阪梅田' || name == '東梅田' || name == '西梅田') return '梅田';
     if (name == '大阪阿部野橋') return '天王寺';
-    
     return name;
   }
 
@@ -143,7 +133,6 @@ class _HomeScreenState extends State<HomeScreen> {
       if (allowedLines.isNotEmpty) {
         for (String line in allowedLines) {
           var stations = await TrainApiService.getStationsByLine(line);
-          // 正規化して比較
           String normalizedCurrent = _normalizeStationName(_nearestStation);
           if (stations.any((s) => _normalizeStationName(s['name']) == normalizedCurrent)) {
             possibleLines.add(line);
@@ -179,7 +168,7 @@ class _HomeScreenState extends State<HomeScreen> {
         'currentLine': selectedLine,
       });
 
-      // 2. 駅許可チェック (正規化対応)
+      // 2. 駅許可チェック
       if (allowedStations.isNotEmpty) {
         String normalizedCurrent = _normalizeStationName(_nearestStation);
         bool isAllowed = allowedStations.any((s) => _normalizeStationName(s.toString()) == normalizedCurrent);
@@ -194,12 +183,17 @@ class _HomeScreenState extends State<HomeScreen> {
       else if (mode == 'E') await _handleModeE(uid);
       else if (mode == 'F') await _handleModeF(uid);
 
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("$_nearestStation ($selectedLine) にチェックイン！")));
+      if (mode != 'E') { // Eは専用の完了メッセージを出すため除外
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("$_nearestStation ($selectedLine) にチェックイン！")));
+      }
     } catch (e) {
       String err = e.toString();
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("エラー: $err"), backgroundColor: Colors.red));
       
-      if (penaltyEnabled && (err.contains("許可されていません") || err.contains("含まれていません"))) {
+      // オセロのルール違反（挟めない）はペナルティ対象から外す
+      bool isOthelloRuleError = err.contains("挟める相手の石がありません");
+      
+      if (penaltyEnabled && !isOthelloRuleError && (err.contains("許可されていません") || err.contains("含まれていません"))) {
         await FirebaseFirestore.instance.collection('games').doc('game_001').collection('players').doc(uid).update({
           'penaltyUntil': Timestamp.fromDate(DateTime.now().add(const Duration(minutes: 5))),
         });
@@ -213,7 +207,6 @@ class _HomeScreenState extends State<HomeScreen> {
   
   Future<void> _handleModeB(String uid) async { 
     if (_finalGoalStation == null) throw "まずはゴールを決めてください！"; if (_nextGoalStation == null) throw "サイコロを振って進む駅を決めてください！"; 
-    // 正規化比較
     if (_normalizeStationName(_nextGoalStation!) == _normalizeStationName(_nearestStation)) { 
       await FirebaseFirestore.instance.collection('games').doc('game_001').collection('players').doc(uid).update({'nextGoalStation': null, 'score': FieldValue.increment(100)}); 
       if (_normalizeStationName(_nearestStation) == _normalizeStationName(_finalGoalStation!)) _showGoalDialog(); 
@@ -224,19 +217,23 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _handleModeC(String uid) async { await FirebaseFirestore.instance.collection('games').doc('game_001').collection('players').doc(uid).update({'isExposed': false, 'lastCheckInAt': FieldValue.serverTimestamp()}); }
   Future<void> _handleModeD(String uid) async { String myTeam = _myData['team'] ?? 'RED'; await FirebaseFirestore.instance.collection('games').doc('game_001').collection('claimed_stations').doc(_nearestStation).set({'name': _nearestStation, 'ownerTeam': myTeam, 'ownerUid': uid, 'claimedAt': FieldValue.serverTimestamp(), 'lat': _myData['location']['lat'], 'lng': _myData['location']['lng'], 'line': _currentLine}); }
   
-  // ★ Mode E: オセロ (正規化対応)
+  // ★ Mode E: オセロ (神アップデート: OthelloLogic連動版)
   Future<void> _handleModeE(String uid) async { 
     String myTeam = _myData['team'] ?? 'RED'; 
     bool turnBased = _gameData['settings_othelloTurnBased'] ?? false; 
-    if (turnBased) { String currentTurn = _gameData['currentTurn'] ?? 'RED'; if (currentTurn != myTeam) throw "現在は ${currentTurn} チームのターンです。"; } 
+    
+    // ターンチェック
+    if (turnBased) { 
+      String currentTurn = _gameData['currentTurn'] ?? 'RED'; 
+      if (currentTurn != myTeam) throw "現在は ${currentTurn} チームのターンです。"; 
+    } 
     
     var boardRef = FirebaseFirestore.instance.collection('games').doc('game_001').collection('othello_board'); 
-    
-    // 全件取得して正規化比較で探す
     var allCells = await boardRef.get();
     QueryDocumentSnapshot? targetDoc;
     String normalizedCurrent = _normalizeStationName(_nearestStation);
 
+    // 盤面から現在地の駅を探す
     for (var doc in allCells.docs) {
       if (_normalizeStationName(doc['station']) == normalizedCurrent) {
         targetDoc = doc;
@@ -245,38 +242,26 @@ class _HomeScreenState extends State<HomeScreen> {
     }
 
     if (targetDoc == null) throw "この駅はオセロ盤に含まれていません"; 
-    if (targetDoc['ownerTeam'] != null) throw "既に石が置かれています"; 
+    
+    Map<String, dynamic> docData = targetDoc.data() as Map<String, dynamic>;
+    if (docData.containsKey('ownerTeam') && docData['ownerTeam'] != null) {
+      throw "既に石が置かれています"; 
+    }
 
-    int tx = targetDoc['x']; int ty = targetDoc['y']; 
     int boardSize = _gameData['settings_boardSize'] ?? 8; 
-    Map<String, String> boardState = {}; 
-    for(var d in allCells.docs) { if (d.data().containsKey('ownerTeam') && d['ownerTeam'] != null) boardState["${d['x']}_${d['y']}"] = d['ownerTeam']; } 
 
-    List<List<int>> directions = [[0, -1], [0, 1], [-1, 0], [1, 0], [-1, -1], [1, -1], [-1, 1], [1, 1]]; 
-    WriteBatch batch = FirebaseFirestore.instance.batch(); 
-    batch.update(targetDoc.reference, {'ownerTeam': myTeam}); 
-    
-    int flippedCount = 0; 
-    for (var dir in directions) { 
-      List<String> stonesToFlip = []; 
-      int cx = tx + dir[0]; int cy = ty + dir[1]; 
-      while (cx >= 0 && cx < boardSize && cy >= 0 && cy < boardSize) { 
-        String key = "${cx}_${cy}"; String? owner = boardState[key]; 
-        if (owner == null) break; 
-        if (owner == myTeam) { 
-          for (String flipKey in stonesToFlip) { batch.update(boardRef.doc(flipKey), {'ownerTeam': myTeam}); flippedCount++; } 
-          break; 
-        } else { stonesToFlip.add(key); } 
-        cx += dir[0]; cy += dir[1]; 
-      } 
-    } 
-    
-    if (turnBased) { String nextTurn = (myTeam == 'RED') ? 'BLUE' : 'RED'; batch.update(FirebaseFirestore.instance.collection('games').doc('game_001'), {'currentTurn': nextTurn}); } 
-    await batch.commit(); 
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(flippedCount > 0 ? "$flippedCount枚 返しました！" : "石を置きました"), backgroundColor: Colors.orange)); 
+    // ★ OthelloLogicを呼び出して、挟み判定と盤面の更新を一気にやってもらう！
+    bool success = await OthelloLogic.tryPlacePiece(targetDoc['station'], myTeam, boardSize);
+
+    // 1枚も挟めない場所だった場合は弾く
+    if (!success) {
+      throw "挟める相手の石がありません！ルールの範囲外です。";
+    }
+
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("石を置き、相手を裏返しました！"), backgroundColor: Colors.orange)); 
   }
   
-  // ★ Mode F: ビンゴ (正規化対応)
+  // ★ Mode F: ビンゴ 
   Future<void> _handleModeF(String uid) async { 
     List<dynamic> card = _myData['bingoCard'] ?? []; 
     if (card.isEmpty) throw "ビンゴカードがありません。"; 
@@ -284,7 +269,6 @@ class _HomeScreenState extends State<HomeScreen> {
     bool hit = false; 
     String normalizedCurrent = _normalizeStationName(_nearestStation);
 
-    // 正規化して比較
     for (var cell in card) { 
       if (_normalizeStationName(cell['station']) == normalizedCurrent && cell['isOpen'] == false) { 
         cell['isOpen'] = true; 
@@ -359,7 +343,6 @@ class _HomeScreenState extends State<HomeScreen> {
           String mode = _gameData['mode'] ?? 'A';
           Timestamp? endTime = _gameData['endTime'];
           
-          // ★修正: 駅名グレーアウト判定も正規化
           List<dynamic> allowedStations = _gameData['allowedStations'] ?? [];
           bool isStationValid = true;
           String normalizedCurrent = _normalizeStationName(_nearestStation);
@@ -367,7 +350,6 @@ class _HomeScreenState extends State<HomeScreen> {
           if (_nearestStation == "---" || _nearestStation == "駅圏外") {
             isStationValid = false;
           } else if (allowedStations.isNotEmpty) {
-            // リスト内の駅と現在地を正規化して比較
             isStationValid = allowedStations.any((s) => _normalizeStationName(s.toString()) == normalizedCurrent);
           }
           

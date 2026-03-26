@@ -40,7 +40,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   bool _isConnected = true;
   bool? _prevOutOfAreaState;
 
-  // ★追加: サイバーモード（地図タイル非表示）フラグ
   bool _isCyberMode = false;
 
   late String _editMode;
@@ -52,12 +51,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   List<dynamic> _cachedCurrentAreaPoints = [];
   bool _cachedAllowSurrender = true;
 
-  // 路線描画用
   List<Polyline> _linePolylines = [];
   List<Marker> _stationMarkers = [];
   bool _linesLoaded = false;
   
-  // 駅座標キャッシュ
   Map<String, LatLng> _stationPositions = {};
 
   @override
@@ -83,7 +80,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         .listen((_) => setState(() => _isConnected = true), onError: (_) => setState(() => _isConnected = false));
   }
 
-  // ★全路線対応カラー定義
   Color _getLineColor(String name) {
     const Map<String, Color> colorMap = {
       // --- 新幹線 ---
@@ -179,6 +175,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       '阪急': Color(0xFF800000), '神戸線': Color(0xFF0D6FB8), '宝塚線': Color(0xFFEE7700),
       '阪神': Color(0xFF1F64B1), '山陽電気': Color(0xFFD0101A), '山陽電鉄': Color(0xFFD0101A),
       '西鉄': Color(0xFF004EA2), 'ゆいレール': Color(0xFFE60012),
+
     };
 
     for (var key in colorMap.keys) {
@@ -255,7 +252,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
             );
           }
 
-          // 路線名ラベル（駅と駅の中間）
           if (i < stations.length - 1 && i % 5 == 2) {
             var nextS = stations[i + 1];
             double nextLat = (nextS['y'] as num).toDouble();
@@ -577,7 +573,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   @override
   Widget build(BuildContext context) {
-    bool isGM = (widget.myRole == 'GAME MASTER');
+    bool isGM = (widget.myRole == 'GAME MASTER' || widget.myRole == 'GM' || widget.myRole == 'ADMIN' || widget.myRole == 'developer');
     bool isHunter = (widget.myRole == 'HUNTER');
     Widget? actionBtn;
     if (isHunter) {
@@ -601,7 +597,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         title: Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
         backgroundColor: Colors.grey[900],
         actions: [
-          // ★追加: 地図表示/非表示切り替えボタン
           if (_editMode == 'NONE')
             IconButton(
               icon: Icon(_isCyberMode ? Icons.map : Icons.layers_clear, color: Colors.cyanAccent),
@@ -728,20 +723,45 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                     if (isMe || isGM) visible = true; else if (pd['role'] == 'HUNTER' && isHunter) visible = true; else if (isHunter && (isExposed || isOutOfArea)) visible = true;
                     if (!visible) continue;
                     
+                    // ★GMのアイコン色を、赤や青に吸収されないように黒（ブラック）に固定
                     Color iconColor = Colors.white;
-                    if (pd['role'] == 'HUNTER') iconColor = Colors.red;
-                    else if (pd['team'] == 'RED') iconColor = Colors.redAccent;
-                    else if (pd['team'] == 'BLUE') iconColor = Colors.blueAccent;
-                    else if (pd['team'] == 'YELLOW') iconColor = Colors.yellowAccent;
-                    else if (pd['team'] == 'GREEN') iconColor = Colors.greenAccent;
+                    bool isGMPlayer = (pd['role'] == 'GAME MASTER' || pd['role'] == 'GM' || pd['role'] == 'developer' || pd['role'] == 'ADMIN');
+                    
+                    if (isGMPlayer) {
+                      iconColor = Colors.black; // GMは黒色でくっきり表示！
+                    } else if (pd['role'] == 'HUNTER') {
+                      iconColor = Colors.red;
+                    } else if (pd['team'] == 'RED') {
+                      iconColor = Colors.redAccent;
+                    } else if (pd['team'] == 'BLUE') {
+                      iconColor = Colors.blueAccent;
+                    } else if (pd['team'] == 'YELLOW') {
+                      iconColor = Colors.yellowAccent;
+                    } else if (pd['team'] == 'GREEN') {
+                      iconColor = Colors.greenAccent;
+                    }
                     
                     double rotation = 0.0;
                     if (isMe) rotation = (_currentHeading * (math.pi / 180));
                     else rotation = (((pd['heading'] as num?)?.toDouble() ?? 0.0) * (math.pi / 180));
 
-                    markers.add(Marker(point: LatLng(pLat, pLng), width: 120, height: 120, child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [Container(padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2), decoration: BoxDecoration(color: Colors.white.withOpacity(0.9), borderRadius: BorderRadius.circular(4), border: Border.all(color: iconColor, width: 1.5)), child: Text("${pd['name']}\n${pd['currentStation'] ?? '移動中'}", textAlign: TextAlign.center, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.black), overflow: TextOverflow.ellipsis, maxLines: 2)), Transform.rotate(angle: rotation, child: Icon(Icons.navigation, color: iconColor, size: 40))])));
+                    markers.add(Marker(
+                      point: LatLng(pLat, pLng), 
+                      width: 120, height: 120, 
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center, 
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2), 
+                            decoration: BoxDecoration(color: Colors.white.withOpacity(0.9), borderRadius: BorderRadius.circular(4), border: Border.all(color: iconColor, width: 1.5)), 
+                            child: Text("${pd['name']}\n${pd['currentStation'] ?? '移動中'}", textAlign: TextAlign.center, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.black), overflow: TextOverflow.ellipsis, maxLines: 2)
+                          ), 
+                          // ★星マーク（Icons.star）を廃止し、通常プレイヤーと同じナビゲーションアイコンに統一
+                          Transform.rotate(angle: rotation, child: Icon(Icons.navigation, color: iconColor, size: 40))
+                        ]
+                      )
+                    ));
 
-                    // すごろくゴール・NEXTマーカー
                     if (isMe) {
                       String? finalGoal = pd['finalGoalStation'];
                       String? nextGoal = pd['nextGoalStation'];
@@ -769,7 +789,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                     onTap: _onMapTap,
                   ),
                   children: [
-                    // ★修正: 地図タイル表示制御 (サイバーモードなら非表示)
                     if (!_isCyberMode)
                       TileLayer(
                         urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',

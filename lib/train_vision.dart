@@ -7,6 +7,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'api_service.dart';
+import 'othello_logic.dart'; // ★追加: オセロ判定ロジック
 
 class TrainVisionScreen extends StatefulWidget {
   final String myRole;
@@ -24,10 +25,13 @@ class TrainVisionScreen extends StatefulWidget {
 
 class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProviderStateMixin {
   late TabController _tabController;
+  late AnimationController _glowController; // ★追加: ピカピカ光るアニメーション用
+  
   List<String> _lines = [];
   Map<String, List<Map<String, dynamic>>> _stationsCache = {};
   bool _isLoading = true;
   String _currentLine = "";
+  String _myTeam = "RED"; // ★追加: 自分のチームカラー
   
   bool _isOthelloMode = false;
   bool _isBingoMode = false;
@@ -64,7 +68,7 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
 
   Color _getLineColor(String name) {
     const Map<String, Color> colorMap = {
-      // --- 新幹線 ---
+// --- 新幹線 ---
       '東海道新幹線': Color(0xFF003366), '山陽新幹線': Color(0xFF003366), '九州新幹線': Color(0xFFFF0000),
       '西九州新幹線': Color(0xFFFF0000), '東北新幹線': Color(0xFF008000), '北海道新幹線': Color(0xFF9ACD32),
       '上越新幹線': Color(0xFFF15A22), '北陸新幹線': Color(0xFF800080), '秋田新幹線': Color(0xFFFF1493),
@@ -159,8 +163,12 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
       '西鉄': Color(0xFF004EA2), 'ゆいレール': Color(0xFFE60012),
 
     };
-    for (var key in colorMap.keys) if (name.contains(key)) return colorMap[key]!;
-    return Colors.grey;
+
+    for (var key in colorMap.keys) {
+      if (name.contains(key)) return colorMap[key]!;
+    }
+    int hash = name.hashCode;
+    return Color((hash & 0xFFFFFF) | 0xFF000000).withOpacity(1.0);
   }
 
   @override
@@ -170,6 +178,12 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
     _fetchGameData();
     _startTimer();
     
+    // ★追加: 1秒かけて光り、1秒かけて消えるループアニメーション
+    _glowController = AnimationController(
+      vsync: this, 
+      duration: const Duration(seconds: 1)
+    )..repeat(reverse: true);
+    
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _sendNotification("ゲームスタート！", "制限時間が始まりました。目的地へ向かってください！");
     });
@@ -178,6 +192,7 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
   @override
   void dispose() {
     _gameTimer?.cancel();
+    _glowController.dispose();
     super.dispose();
   }
 
@@ -258,9 +273,13 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
 
   Future<void> _fetchGameData() async {
     var myDoc = await FirebaseFirestore.instance.collection('games').doc('game_001').collection('players').doc(FirebaseAuth.instance.currentUser!.uid).get();
-    _currentLine = myDoc.data()?['currentLine'] ?? "";
+    if (mounted && myDoc.exists) {
+      setState(() {
+        _currentLine = myDoc.data()?['currentLine'] ?? "";
+        _myTeam = myDoc.data()?['team'] ?? 'RED';
+      });
+    }
 
-    // ★変更：リアルタイムでターン情報を受け取るためのリスナー
     FirebaseFirestore.instance.collection('games').doc('game_001').snapshots().listen((doc) async {
       if (!doc.exists || !mounted) return;
       var data = doc.data()!;
@@ -276,8 +295,6 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
         _isSurvivalMode = (mode == 'C');
         _isSugorokuMode = (mode == 'B');
         _boardSize = data['settings_boardSize'] ?? 8;
-        
-        // ★追加：ターン制のデータ同期
         _isTurnBased = data['othelloTurnBased'] ?? false;
         _currentTurnTeam = data['currentTurn'] ?? 'RED';
         if (data['turnEndTime'] != null) {
@@ -285,7 +302,6 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
         }
       });
 
-      // 初回のみ駅データをキャッシュして構築
       if (_lines.isEmpty) {
         for (String line in allowedLines) {
           var stations = await TrainApiService.getStationsByLine(line);
@@ -308,7 +324,6 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
             _lines = List<String>.from(allowedLines);
             _allowedStations = activeStations.toList();
             _isLoading = false;
-            
             int initialIndex = 0;
             if (_lines.contains(_currentLine)) initialIndex = _lines.indexOf(_currentLine) + 1; 
             _tabController = TabController(length: _lines.length + 1, vsync: this, initialIndex: initialIndex);
@@ -318,31 +333,24 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
     });
   }
 
-  // --- 経路探索機能 ---
   void _showRouteSearch() {
     String startStation = "";
     String endStation = "";
     List<String> routeResult = [];
-    
-    List<String> allStations = _stationsCache.values
-        .expand((list) => list.map((s) => s['name'] as String))
-        .toSet()
-        .toList();
+    List<String> allStations = _stationsCache.values.expand((list) => list.map((s) => s['name'] as String)).toSet().toList();
 
     showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
+      context: context, 
+      isScrollControlled: true, 
       backgroundColor: Colors.white,
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
       builder: (ctx) {
         return StatefulBuilder(
           builder: (BuildContext context, StateSetter setModalState) {
-            
             void calculateRoute() {
               if (startStation.isEmpty || endStation.isEmpty) return;
               String start = _normalizeStationName(startStation);
               String end = _normalizeStationName(endStation);
-
               if (start == end) {
                 setModalState(() { routeResult = ["出発駅と到着駅が同じです"]; });
                 return;
@@ -358,7 +366,6 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
                 for (int i = 0; i < stations.length; i++) {
                   String current = _normalizeStationName(stations[i]['name']);
                   if (!graph.containsKey(current)) graph[current] = [];
-
                   if (i > 0) {
                     String prev = _normalizeStationName(stations[i - 1]['name']);
                     graph[current]!.add({'to': prev, 'line': line, 'dir': firstStation});
@@ -460,7 +467,8 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
                     onSelected: (selection) => startStation = selection,
                     fieldViewBuilder: (context, controller, focusNode, onEditingComplete) {
                       return TextField(
-                        controller: controller, focusNode: focusNode,
+                        controller: controller,
+                        focusNode: focusNode,
                         decoration: const InputDecoration(labelText: "出発駅", prefixIcon: Icon(Icons.trip_origin, color: Colors.green)),
                       );
                     },
@@ -474,7 +482,8 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
                     onSelected: (selection) => endStation = selection,
                     fieldViewBuilder: (context, controller, focusNode, onEditingComplete) {
                       return TextField(
-                        controller: controller, focusNode: focusNode,
+                        controller: controller,
+                        focusNode: focusNode,
                         decoration: const InputDecoration(labelText: "到着駅", prefixIcon: Icon(Icons.place, color: Colors.red)),
                       );
                     },
@@ -567,7 +576,6 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
     );
   }
 
-  // ★追加：ターン制のカウントダウンバナー
   Widget _buildTurnBanner() {
     int remaining = 0;
     if (_turnEndTime != null) {
@@ -594,8 +602,14 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
 
     String firstTabTitle = "全線一覧";
     IconData firstTabIcon = Icons.grid_view;
-    if (_isOthelloMode) { firstTabTitle = "オセロ盤"; firstTabIcon = Icons.grid_4x4; }
-    if (_isBingoMode) { firstTabTitle = "BINGO CARD"; firstTabIcon = Icons.grid_on; }
+    if (_isOthelloMode) {
+      firstTabTitle = "オセロ盤";
+      firstTabIcon = Icons.grid_4x4;
+    }
+    if (_isBingoMode) {
+      firstTabTitle = "BINGO CARD";
+      firstTabIcon = Icons.grid_on;
+    }
 
     return Scaffold(
       backgroundColor: Colors.white,
@@ -636,7 +650,6 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
       ),
       body: Column(
         children: [
-          // ★追加：オセロモード＆ターン制ONの時だけタイマーを表示
           if (_isOthelloMode && _isTurnBased) _buildTurnBanner(),
           Expanded(
             child: TabBarView(
@@ -645,8 +658,11 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
               children: [
                 _buildSpecialTab(), 
                 ..._lines.map((line) {
-                  if (line.contains("環状") || line.contains("山手")) return _buildLoopLineView(line);
-                  else return _buildVerticalLineView(line);
+                  if (line.contains("環状") || line.contains("山手")) {
+                    return _buildLoopLineView(line);
+                  } else {
+                    return _buildVerticalLineView(line);
+                  }
                 }),
               ],
             ),
@@ -788,19 +804,62 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
   }
 
   Widget _buildExcelGrid({required int rows, required int cols, required Widget Function(int x, int y) cellBuilder}) {
-    const double cellSize = 70.0; const double headerSize = 30.0;
+    const double cellSize = 70.0; 
+    const double headerSize = 30.0;
     List<Widget> colHeaders = [];
     for (int x = 0; x < cols; x++) {
-      colHeaders.add(Container(width: cellSize, height: headerSize, alignment: Alignment.center, decoration: BoxDecoration(color: Colors.grey[200], border: Border.all(color: Colors.grey)), child: Text(String.fromCharCode(65 + x), style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.black))));
+      colHeaders.add(
+        Container(
+          width: cellSize, 
+          height: headerSize, 
+          alignment: Alignment.center, 
+          decoration: BoxDecoration(color: Colors.grey[200], border: Border.all(color: Colors.grey)), 
+          child: Text(String.fromCharCode(65 + x), style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.black))
+        )
+      );
     }
+    
     List<TableRow> tableRows = [];
     for (int y = 0; y < rows; y++) {
       List<Widget> rowChildren = [];
-      rowChildren.add(Container(width: headerSize, height: cellSize, alignment: Alignment.center, decoration: BoxDecoration(color: Colors.grey[200], border: Border.all(color: Colors.grey)), child: Text("${y + 1}", style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.black))));
-      for (int x = 0; x < cols; x++) rowChildren.add(SizedBox(width: cellSize, height: cellSize, child: cellBuilder(x, y)));
+      rowChildren.add(
+        Container(
+          width: headerSize, 
+          height: cellSize, 
+          alignment: Alignment.center, 
+          decoration: BoxDecoration(color: Colors.grey[200], border: Border.all(color: Colors.grey)), 
+          child: Text("${y + 1}", style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.black))
+        )
+      );
+      
+      for (int x = 0; x < cols; x++) {
+        rowChildren.add(SizedBox(width: cellSize, height: cellSize, child: cellBuilder(x, y)));
+      }
       tableRows.add(TableRow(children: rowChildren));
     }
-    return SingleChildScrollView(scrollDirection: Axis.vertical, child: SingleChildScrollView(scrollDirection: Axis.horizontal, child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Row(children: [Container(width: headerSize, height: headerSize, color: Colors.grey[300]), ...colHeaders]), Table(defaultColumnWidth: const IntrinsicColumnWidth(), border: TableBorder.all(color: Colors.grey, width: 0.5), children: tableRows)])));
+    
+    return SingleChildScrollView(
+      scrollDirection: Axis.vertical, 
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal, 
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start, 
+          children: [
+            Row(
+              children: [
+                Container(width: headerSize, height: headerSize, color: Colors.grey[300]), 
+                ...colHeaders
+              ]
+            ), 
+            Table(
+              defaultColumnWidth: const IntrinsicColumnWidth(), 
+              border: TableBorder.all(color: Colors.grey, width: 0.5), 
+              children: tableRows
+            )
+          ]
+        )
+      )
+    );
   }
 
   Widget _buildBingoCard() {
@@ -808,6 +867,7 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
       stream: FirebaseFirestore.instance.collection('games').doc('game_001').collection('players').doc(FirebaseAuth.instance.currentUser!.uid).snapshots(),
       builder: (context, snapshot) {
         if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
+        
         var data = snapshot.data!.data() as Map<String, dynamic>;
         List<dynamic> card = data['bingoCard'] ?? [];
         int rank = data['bingoRank'] ?? 0;
@@ -817,22 +877,41 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
         return Column(
           children: [
             Container(
-              padding: const EdgeInsets.all(10), width: double.infinity, color: rank > 0 ? Colors.amber : Colors.blue[900],
-              child: Text(rank > 0 ? "🎉 BINGO達成! $rank位" : "対象駅で穴を開けろ！", style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16), textAlign: TextAlign.center),
+              padding: const EdgeInsets.all(10), 
+              width: double.infinity, 
+              color: rank > 0 ? Colors.amber : Colors.blue[900],
+              child: Text(
+                rank > 0 ? "🎉 BINGO達成! $rank位" : "対象駅で穴を開けろ！", 
+                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16), 
+                textAlign: TextAlign.center
+              ),
             ),
             Expanded(
               child: _buildExcelGrid(
-                rows: _boardSize, cols: _boardSize,
+                rows: _boardSize, 
+                cols: _boardSize,
                 cellBuilder: (x, y) {
                   int index = y * _boardSize + x;
                   var cell = card.firstWhere((e) => e['index'] == index, orElse: () => {'station': '', 'isOpen': false});
-                  bool isOpen = cell['isOpen']; String name = cell['station'];
+                  bool isOpen = cell['isOpen']; 
+                  String name = cell['station'];
+                  
                   return Container(
-                    color: isOpen ? Colors.orange[100] : Colors.white, alignment: Alignment.center,
-                    child: Stack(alignment: Alignment.center, children: [
-                      Text(name, textAlign: TextAlign.center, style: TextStyle(color: isOpen ? Colors.black : Colors.black87, fontWeight: FontWeight.bold, fontSize: 10), overflow: TextOverflow.ellipsis, maxLines: 3),
-                      if(isOpen) const Icon(Icons.circle_outlined, color: Colors.red, size: 40),
-                    ]),
+                    color: isOpen ? Colors.orange[100] : Colors.white, 
+                    alignment: Alignment.center,
+                    child: Stack(
+                      alignment: Alignment.center, 
+                      children: [
+                        Text(
+                          name, 
+                          textAlign: TextAlign.center, 
+                          style: TextStyle(color: isOpen ? Colors.black : Colors.black87, fontWeight: FontWeight.bold, fontSize: 10), 
+                          overflow: TextOverflow.ellipsis, 
+                          maxLines: 3
+                        ),
+                        if(isOpen) const Icon(Icons.circle_outlined, color: Colors.red, size: 40),
+                      ]
+                    ),
                   );
                 },
               ),
@@ -848,23 +927,97 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
       stream: FirebaseFirestore.instance.collection('games').doc('game_001').collection('othello_board').snapshots(),
       builder: (context, snapshot) {
         if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
-        Map<String, Map<String, dynamic>> boardData = {}; for (var doc in snapshot.data!.docs) { var d = doc.data() as Map<String, dynamic>; boardData["${d['x']}_${d['y']}"] = d; }
-        int red = 0, blue = 0; boardData.values.forEach((v) { if (v['ownerTeam'] == 'RED') red++; if (v['ownerTeam'] == 'BLUE') blue++; });
         
+        Map<String, Map<String, dynamic>> boardData = {}; 
+        for (var doc in snapshot.data!.docs) { 
+          var d = doc.data() as Map<String, dynamic>; 
+          boardData["${d['x']}_${d['y']}"] = d; 
+        }
+        
+        int red = 0;
+        int blue = 0; 
+        boardData.values.forEach((v) { 
+          if (v['ownerTeam'] == 'RED') red++; 
+          if (v['ownerTeam'] == 'BLUE') blue++; 
+        });
+        
+        // ★追加: ピカピカ光らせる対象チームを決定
+        String highlightTeam = _myTeam;
+        if (widget.myRole == 'GAME MASTER' || widget.myRole == 'GM' || widget.myRole == 'developer' || widget.myRole == 'ADMIN') {
+          highlightTeam = _currentTurnTeam; // GMは現在のターンのチームの置ける場所を見る
+        } else if (_isTurnBased && _currentTurnTeam != _myTeam) {
+          highlightTeam = ""; // ターン制の場合、自分のターンじゃない時は光らせない
+        }
+
+        // 盤面全体から「置ける場所」のリストを抽出
+        List<String> validMoves = [];
+        if (highlightTeam.isNotEmpty) {
+          validMoves = OthelloLogic.getValidMoves(highlightTeam, boardData, _boardSize);
+        }
+
         return Column(
           children: [
-            Padding(padding: const EdgeInsets.all(8.0), child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [Text("RED: $red", style: const TextStyle(color: Colors.redAccent, fontSize: 20, fontWeight: FontWeight.bold)), Text("BLUE: $blue", style: const TextStyle(color: Colors.blueAccent, fontSize: 20, fontWeight: FontWeight.bold))])), 
+            Padding(
+              padding: const EdgeInsets.all(8.0), 
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly, 
+                children: [
+                  Text("RED: $red", style: const TextStyle(color: Colors.redAccent, fontSize: 20, fontWeight: FontWeight.bold)), 
+                  Text("BLUE: $blue", style: const TextStyle(color: Colors.blueAccent, fontSize: 20, fontWeight: FontWeight.bold))
+                ]
+              )
+            ), 
             Expanded(
               child: _buildExcelGrid(
-                rows: _boardSize, cols: _boardSize,
+                rows: _boardSize, 
+                cols: _boardSize,
                 cellBuilder: (x, y) {
-                  var cell = boardData["${x}_$y"]; String stationName = cell?['station'] ?? ""; String? owner = cell?['ownerTeam']; 
-                  return Container(
-                    color: Colors.white, alignment: Alignment.center, 
+                  var cell = boardData["${x}_$y"]; 
+                  String stationName = cell?['station'] ?? ""; 
+                  String? owner = cell?['ownerTeam']; 
+                  
+                  // このマスが置ける場所かどうかを判定
+                  bool isValidMove = validMoves.contains("${x}_$y");
+
+                  Widget content = Container(
+                    color: Colors.white, 
+                    alignment: Alignment.center, 
                     child: owner != null 
-                      ? Container(width: 40, height: 40, decoration: BoxDecoration(color: owner == 'RED' ? Colors.red : Colors.blue, shape: BoxShape.circle), alignment: Alignment.center, child: Text(stationName, style: const TextStyle(fontSize: 8, color: Colors.white, fontWeight: FontWeight.bold), textAlign: TextAlign.center, overflow: TextOverflow.ellipsis, maxLines: 2)) 
+                      ? Container(
+                          width: 40, 
+                          height: 40, 
+                          decoration: BoxDecoration(color: owner == 'RED' ? Colors.red : Colors.blue, shape: BoxShape.circle), 
+                          alignment: Alignment.center, 
+                          child: Text(stationName, style: const TextStyle(fontSize: 8, color: Colors.white, fontWeight: FontWeight.bold), textAlign: TextAlign.center, overflow: TextOverflow.ellipsis, maxLines: 2)
+                        ) 
                       : Text(stationName, style: const TextStyle(fontSize: 10, color: Colors.black), textAlign: TextAlign.center, overflow: TextOverflow.ellipsis, maxLines: 2)
                   ); 
+
+                  // ★置ける場所なら、アニメーションで光らせる！
+                  if (isValidMove) {
+                    return AnimatedBuilder(
+                      animation: _glowController,
+                      builder: (context, child) {
+                        return Container(
+                          decoration: BoxDecoration(
+                            // 枠線と影の強さが0.0〜1.0で変化してホタルのように光る
+                            border: Border.all(color: Colors.amber, width: 2 + (_glowController.value * 2)),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.amber.withOpacity(0.3 + (_glowController.value * 0.3)), 
+                                blurRadius: 5 + (_glowController.value * 10), 
+                                spreadRadius: _glowController.value * 3
+                              )
+                            ]
+                          ),
+                          child: content,
+                        );
+                      },
+                    );
+                  }
+                  
+                  // 置けない場所は普通に描画
+                  return content;
                 },
               ),
             ),
@@ -878,25 +1031,89 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
     return StreamBuilder<QuerySnapshot>(
       stream: FirebaseFirestore.instance.collection('games').doc('game_001').collection('claimed_stations').snapshots(), 
       builder: (context, claimedSnap) { 
-        Map<String, String> ownership = {}; if (claimedSnap.hasData) for (var doc in claimedSnap.data!.docs) ownership[doc['name']] = doc['ownerTeam']; 
+        Map<String, String> ownership = {}; 
+        if (claimedSnap.hasData) {
+          for (var doc in claimedSnap.data!.docs) {
+            ownership[doc['name']] = doc['ownerTeam']; 
+          }
+        }
+        
         return ListView.builder(
-          padding: const EdgeInsets.all(10), itemCount: _lines.length, 
+          padding: const EdgeInsets.all(10), 
+          itemCount: _lines.length, 
           itemBuilder: (context, index) { 
-            String lineName = _lines[index]; List<Map<String, dynamic>> stations = _stationsCache[lineName] ?? []; Color lineColor = _getLineColor(lineName); int redCount = 0; int blueCount = 0; for(var s in stations) { String sName = s['name']; if (ownership[sName] == 'RED') redCount++; if (ownership[sName] == 'BLUE') blueCount++; } 
+            String lineName = _lines[index]; 
+            List<Map<String, dynamic>> stations = _stationsCache[lineName] ?? []; 
+            Color lineColor = _getLineColor(lineName); 
+            int redCount = 0; 
+            int blueCount = 0; 
+            
+            for(var s in stations) { 
+              String sName = s['name']; 
+              if (ownership[sName] == 'RED') redCount++; 
+              if (ownership[sName] == 'BLUE') blueCount++; 
+            } 
+            
             return Card(
-              color: Colors.white, elevation: 2, margin: const EdgeInsets.only(bottom: 10), 
-              child: Padding(padding: const EdgeInsets.all(12.0), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [Text(lineName, style: TextStyle(color: lineColor, fontWeight: FontWeight.bold, fontSize: 16)), Text("RED: $redCount  BLUE: $blueCount", style: const TextStyle(color: Colors.black54, fontSize: 12))]), const SizedBox(height: 10), Wrap(spacing: 4, runSpacing: 4, children: stations.map((s) { String sName = s['name']; Color dotColor = Colors.grey[200]!; if (ownership[sName] == 'RED') dotColor = Colors.redAccent; if (ownership[sName] == 'BLUE') dotColor = Colors.blueAccent; return Tooltip(message: sName, child: Container(width: 12, height: 12, decoration: BoxDecoration(color: dotColor, shape: BoxShape.circle, border: Border.all(color: Colors.black, width: 1)))); }).toList())]))); 
+              color: Colors.white, 
+              elevation: 2, 
+              margin: const EdgeInsets.only(bottom: 10), 
+              child: Padding(
+                padding: const EdgeInsets.all(12.0), 
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start, 
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween, 
+                      children: [
+                        Text(lineName, style: TextStyle(color: lineColor, fontWeight: FontWeight.bold, fontSize: 16)), 
+                        Text("RED: $redCount  BLUE: $blueCount", style: const TextStyle(color: Colors.black54, fontSize: 12))
+                      ]
+                    ), 
+                    const SizedBox(height: 10), 
+                    Wrap(
+                      spacing: 4, 
+                      runSpacing: 4, 
+                      children: stations.map((s) { 
+                        String sName = s['name']; 
+                        Color dotColor = Colors.grey[200]!; 
+                        if (ownership[sName] == 'RED') dotColor = Colors.redAccent; 
+                        if (ownership[sName] == 'BLUE') dotColor = Colors.blueAccent; 
+                        
+                        return Tooltip(
+                          message: sName, 
+                          child: Container(
+                            width: 12, 
+                            height: 12, 
+                            decoration: BoxDecoration(
+                              color: dotColor, 
+                              shape: BoxShape.circle, 
+                              border: Border.all(color: Colors.black, width: 1)
+                            )
+                          )
+                        ); 
+                      }).toList()
+                    )
+                  ]
+                )
+              )
+            ); 
           }
         ); 
       }
     ); 
   }
 
-  Widget _buildLoopLineView(String lineName) { return _buildCommonLineView(lineName, isLoop: true); }
-  Widget _buildVerticalLineView(String lineName) { return _buildCommonLineView(lineName, isLoop: false); }
+  Widget _buildLoopLineView(String lineName) { 
+    return _buildCommonLineView(lineName, isLoop: true); 
+  }
+  
+  Widget _buildVerticalLineView(String lineName) { 
+    return _buildCommonLineView(lineName, isLoop: false); 
+  }
   
   Widget _buildCommonLineView(String lineName, {required bool isLoop}) {
-    List<Map<String, dynamic>> stations = _stationsCache[lineName] ?? [];
+    List<Map<String, dynamic>> stations = _stationsCache[lineName] ?? []; 
     Color lineColor = _getLineColor(lineName);
     
     return StreamBuilder<QuerySnapshot>(
@@ -905,39 +1122,198 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
         return StreamBuilder<QuerySnapshot>(
           stream: FirebaseFirestore.instance.collection('games').doc('game_001').collection('othello_board').snapshots(), 
           builder: (context, claimedSnap) {
-            Map<String, String> ownership = {}; if (claimedSnap.hasData) for (var doc in claimedSnap.data!.docs) { if(doc.data().toString().contains('ownerTeam') && doc['ownerTeam'] != null) ownership[doc['station']] = doc['ownerTeam']; }
-            Map<String, List<Map<String, dynamic>>> playerPos = {}; if (playerSnap.hasData) for (var doc in playerSnap.data!.docs) { var pd = doc.data() as Map<String, dynamic>; if (pd['currentStation'] != null) { if (playerPos[pd['currentStation']] == null) playerPos[pd['currentStation']] = []; playerPos[pd['currentStation']]!.add(pd); } }
+            Map<String, String> ownership = {}; 
+            if (claimedSnap.hasData) {
+              for (var doc in claimedSnap.data!.docs) { 
+                if(doc.data().toString().contains('ownerTeam') && doc['ownerTeam'] != null) {
+                  ownership[doc['station']] = doc['ownerTeam']; 
+                }
+              }
+            }
+            
+            Map<String, List<Map<String, dynamic>>> playerPos = {}; 
+            if (playerSnap.hasData) {
+              for (var doc in playerSnap.data!.docs) { 
+                var pd = doc.data() as Map<String, dynamic>; 
+                if (pd['currentStation'] != null) { 
+                  if (playerPos[pd['currentStation']] == null) {
+                    playerPos[pd['currentStation']] = []; 
+                  }
+                  playerPos[pd['currentStation']]!.add(pd); 
+                } 
+              }
+            }
 
             if (isLoop) {
-              return LayoutBuilder(builder: (context, constraints) {
-                double centerX = constraints.maxWidth / 2; double centerY = constraints.maxHeight / 2; double radius = min(centerX, centerY) - 60;
-                return Stack(alignment: Alignment.center, children: [Text(lineName, style: TextStyle(color: lineColor.withOpacity(0.1), fontSize: 30, fontWeight: FontWeight.bold)), Container(width: radius * 2, height: radius * 2, decoration: BoxDecoration(shape: BoxShape.circle, border: Border.all(color: lineColor, width: 8))), ...List.generate(stations.length, (index) { 
-                  final station = stations[index]; String sName = station['name']; bool isValid = _allowedStations.isEmpty || _allowedStations.any((s) => _normalizeStationName(s) == _normalizeStationName(sName)); double angle = (2 * pi * index / stations.length) - (pi / 2); double x = centerX + radius * cos(angle); double y = centerY + radius * sin(angle); Color stationColor = isValid ? Colors.white : Colors.grey[200]!; Color borderColor = isValid ? Colors.black : Colors.grey[300]!; if (ownership[sName] == 'RED') stationColor = Colors.red; else if (ownership[sName] == 'BLUE') stationColor = Colors.blue; bool isHighlighted = (_normalizeStationName(sName) == _normalizeStationName(_highlightedStation ?? "")); Widget? playerIcon; 
+              return LayoutBuilder(
+                builder: (context, constraints) {
+                  double centerX = constraints.maxWidth / 2; 
+                  double centerY = constraints.maxHeight / 2; 
+                  double radius = min(centerX, centerY) - 60;
+                  
+                  return Stack(
+                    alignment: Alignment.center, 
+                    children: [
+                      Text(lineName, style: TextStyle(color: lineColor.withOpacity(0.1), fontSize: 30, fontWeight: FontWeight.bold)), 
+                      Container(width: radius * 2, height: radius * 2, decoration: BoxDecoration(shape: BoxShape.circle, border: Border.all(color: lineColor, width: 8))), 
+                      ...List.generate(stations.length, (index) { 
+                        final station = stations[index]; 
+                        String sName = station['name']; 
+                        bool isValid = _allowedStations.isEmpty || _allowedStations.any((s) => _normalizeStationName(s) == _normalizeStationName(sName)); 
+                        double angle = (2 * pi * index / stations.length) - (pi / 2); 
+                        double x = centerX + radius * cos(angle); 
+                        double y = centerY + radius * sin(angle); 
+                        Color stationColor = isValid ? Colors.white : Colors.grey[200]!; 
+                        Color borderColor = isValid ? Colors.black : Colors.grey[300]!; 
+                        
+                        if (ownership[sName] == 'RED') {
+                          stationColor = Colors.red; 
+                        } else if (ownership[sName] == 'BLUE') {
+                          stationColor = Colors.blue; 
+                        }
+                        
+                        bool isHighlighted = (_normalizeStationName(sName) == _normalizeStationName(_highlightedStation ?? "")); 
+                        Widget? playerIcon; 
+                        
+                        if (playerPos.containsKey(sName)) { 
+                          var p = playerPos[sName]!.first; 
+                          Color pColor = Colors.grey; 
+                          IconData pIcon = Icons.train;
+                          
+                          if (p['team'] == 'RED') {
+                            pColor = Colors.red; 
+                          } else if (p['team'] == 'BLUE') {
+                            pColor = Colors.blue; 
+                          }
+                          
+                          // ★変更：GM（デベロッパー）は金色の星アイコンに！
+                          if (p['role'] == 'GAME MASTER' || p['role'] == 'GM' || p['role'] == 'developer' || p['role'] == 'ADMIN') { 
+                            pColor = Colors.amber; 
+                            pIcon = Icons.star; 
+                          }
+                          
+                          playerIcon = Container(
+                            padding: const EdgeInsets.all(4), 
+                            decoration: BoxDecoration(color: pColor, shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 2)), 
+                            child: Icon(pIcon, color: Colors.white, size: 14)
+                          ); 
+                        } 
+                        
+                        return Positioned(
+                          left: x - 40, 
+                          top: y - 20, 
+                          child: SizedBox(
+                            width: 80, 
+                            child: Column(
+                              children: [
+                                Stack(
+                                  alignment: Alignment.topCenter, 
+                                  children: [
+                                    playerIcon ?? Container(width: 16, height: 16, decoration: BoxDecoration(color: stationColor, shape: BoxShape.circle, border: Border.all(color: borderColor, width: 2))), 
+                                    if(isHighlighted) const Positioned(top: -20, child: Icon(Icons.push_pin, color: Colors.redAccent, size: 24))
+                                  ]
+                                ), 
+                                const SizedBox(height: 4), 
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2), 
+                                  decoration: BoxDecoration(color: isValid ? Colors.white.withOpacity(0.8) : Colors.transparent, borderRadius: BorderRadius.circular(4)), 
+                                  child: Text(sName, style: TextStyle(color: isValid ? Colors.black : Colors.grey[300], fontSize: 10, fontWeight: FontWeight.bold), textAlign: TextAlign.center)
+                                )
+                              ]
+                            )
+                          )
+                        ); 
+                      })
+                    ]
+                  );
+                }
+              );
+            } else {
+              return ListView.builder(
+                padding: const EdgeInsets.symmetric(vertical: 20), 
+                itemCount: stations.length, 
+                itemBuilder: (context, index) { 
+                  final station = stations[index]; 
+                  String sName = station['name']; 
+                  bool isValid = _allowedStations.isEmpty || _allowedStations.any((s) => _normalizeStationName(s) == _normalizeStationName(sName)); 
+                  Color dotColor = isValid ? Colors.white : Colors.grey[200]!; 
+                  Color borderColor = isValid ? lineColor : Colors.grey[300]!; 
+                  Color textColor = isValid ? Colors.black : Colors.grey[300]!; 
+                  
+                  if (ownership[sName] == 'RED') {
+                    dotColor = Colors.red; 
+                  } else if (ownership[sName] == 'BLUE') {
+                    dotColor = Colors.blue; 
+                  }
+                  
+                  bool isHighlighted = (_normalizeStationName(sName) == _normalizeStationName(_highlightedStation ?? "")); 
+                  List<Widget> icons = []; 
                   
                   if (playerPos.containsKey(sName)) { 
-                    var p = playerPos[sName]!.first; Color pColor = Colors.grey; IconData pIcon = Icons.train;
-                    if (p['team'] == 'RED') pColor = Colors.red; if (p['team'] == 'BLUE') pColor = Colors.blue;
-                    // ★変更：GM（デベロッパー）は金色の星アイコンに！
-                    if (p['role'] == 'GM' || p['role'] == 'developer' || p['role'] == 'ADMIN') { pColor = Colors.amber; pIcon = Icons.star; }
-                    playerIcon = Container(padding: const EdgeInsets.all(4), decoration: BoxDecoration(color: pColor, shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 2)), child: Icon(pIcon, color: Colors.white, size: 14)); 
+                    for (var p in playerPos[sName]!) { 
+                      Color tc = Colors.grey; 
+                      IconData ti = Icons.train;
+                      
+                      if(p['team'] == 'RED') {
+                        tc = Colors.red; 
+                      } else if(p['team'] == 'BLUE') {
+                        tc = Colors.blue; 
+                      }
+                      
+                      // ★変更：GM（デベロッパー）は金色の星アイコンに！
+                      if (p['role'] == 'GAME MASTER' || p['role'] == 'GM' || p['role'] == 'developer' || p['role'] == 'ADMIN') { 
+                        tc = Colors.amber; 
+                        ti = Icons.star; 
+                      }
+                      
+                      icons.add(Container(margin:const EdgeInsets.only(left:4), child: Icon(ti, color: tc, size:20))); 
+                    } 
                   } 
-                  return Positioned(left: x - 40, top: y - 20, child: SizedBox(width: 80, child: Column(children: [Stack(alignment: Alignment.topCenter, children: [playerIcon ?? Container(width: 16, height: 16, decoration: BoxDecoration(color: stationColor, shape: BoxShape.circle, border: Border.all(color: borderColor, width: 2))), if(isHighlighted) const Positioned(top: -20, child: Icon(Icons.push_pin, color: Colors.redAccent, size: 24))]), const SizedBox(height: 4), Container(padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2), decoration: BoxDecoration(color: isValid ? Colors.white.withOpacity(0.8) : Colors.transparent, borderRadius: BorderRadius.circular(4)), child: Text(sName, style: TextStyle(color: isValid ? Colors.black : Colors.grey[300], fontSize: 10, fontWeight: FontWeight.bold), textAlign: TextAlign.center))]))); })]);
-              });
-            } else {
-              return ListView.builder(padding: const EdgeInsets.symmetric(vertical: 20), itemCount: stations.length, itemBuilder: (context, index) { 
-                final station = stations[index]; String sName = station['name']; bool isValid = _allowedStations.isEmpty || _allowedStations.any((s) => _normalizeStationName(s) == _normalizeStationName(sName)); Color dotColor = isValid ? Colors.white : Colors.grey[200]!; Color borderColor = isValid ? lineColor : Colors.grey[300]!; Color textColor = isValid ? Colors.black : Colors.grey[300]!; if (ownership[sName] == 'RED') dotColor = Colors.red; else if (ownership[sName] == 'BLUE') dotColor = Colors.blue; bool isHighlighted = (_normalizeStationName(sName) == _normalizeStationName(_highlightedStation ?? "")); 
-                List<Widget> icons = []; 
-                if (playerPos.containsKey(sName)) { 
-                  for (var p in playerPos[sName]!) { 
-                    Color tc = Colors.grey; IconData ti = Icons.train;
-                    if(p['team']=='RED') tc = Colors.red; if(p['team']=='BLUE') tc = Colors.blue; 
-                    // ★変更：GM（デベロッパー）は金色の星アイコンに！
-                    if (p['role'] == 'GM' || p['role'] == 'developer' || p['role'] == 'ADMIN') { tc = Colors.amber; ti = Icons.star; }
-                    icons.add(Container(margin:const EdgeInsets.only(left:4), child: Icon(ti, color: tc, size:20))); 
-                  } 
-                } 
-                return SizedBox(height: 60, child: Row(children: [Expanded(flex: 4, child: Container(alignment: Alignment.centerRight, padding: const EdgeInsets.only(right: 16), child: Row(mainAxisAlignment: MainAxisAlignment.end, children: [if(isHighlighted) const Icon(Icons.push_pin, color: Colors.redAccent, size: 20), const SizedBox(width: 8), Text(sName, style: TextStyle(color: textColor, fontWeight: FontWeight.bold, fontSize: 16))]))), SizedBox(width: 40, child: Stack(alignment: Alignment.center, children: [Container(width: 10, color: borderColor, margin: EdgeInsets.only(top: index==0?30:0, bottom: index==stations.length-1?30:0)), Container(width: 18, height: 18, decoration: BoxDecoration(color: Colors.white, shape: BoxShape.circle, border: Border.all(color: borderColor, width: 4), boxShadow: [BoxShadow(color: dotColor == Colors.white ? Colors.transparent : dotColor, blurRadius: 5)]))])), Expanded(flex: 4, child: Row(children: icons))])); 
-              });
+                  
+                  return SizedBox(
+                    height: 60, 
+                    child: Row(
+                      children: [
+                        Expanded(
+                          flex: 4, 
+                          child: Container(
+                            alignment: Alignment.centerRight, 
+                            padding: const EdgeInsets.only(right: 16), 
+                            child: Row(
+                              mainAxisAlignment: MainAxisAlignment.end, 
+                              children: [
+                                if(isHighlighted) const Icon(Icons.push_pin, color: Colors.redAccent, size: 20), 
+                                const SizedBox(width: 8), 
+                                Text(sName, style: TextStyle(color: textColor, fontWeight: FontWeight.bold, fontSize: 16))
+                              ]
+                            )
+                          )
+                        ), 
+                        SizedBox(
+                          width: 40, 
+                          child: Stack(
+                            alignment: Alignment.center, 
+                            children: [
+                              Container(width: 10, color: borderColor, margin: EdgeInsets.only(top: index == 0 ? 30 : 0, bottom: index == stations.length - 1 ? 30 : 0)), 
+                              Container(
+                                width: 18, 
+                                height: 18, 
+                                decoration: BoxDecoration(
+                                  color: Colors.white, 
+                                  shape: BoxShape.circle, 
+                                  border: Border.all(color: borderColor, width: 4), 
+                                  boxShadow: [BoxShadow(color: dotColor == Colors.white ? Colors.transparent : dotColor, blurRadius: 5)]
+                                )
+                              )
+                            ]
+                          )
+                        ), 
+                        Expanded(flex: 4, child: Row(children: icons))
+                      ]
+                    )
+                  ); 
+                }
+              );
             }
           }
         );
