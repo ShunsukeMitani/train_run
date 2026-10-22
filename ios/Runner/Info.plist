@@ -8,7 +8,10 @@
         <string>https</string>
         <string>http</string>
     </array>
-
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>オセロ盤面の記録を写真に保存するためにアクセス権限が必要です。</string>
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>オセロ盤面の記録を写真に保存するためにアクセス権限が必要です。</string>
     <key>NSLocationWhenInUseUsageDescription</key>
     <string>逃走エリアのマップ表示と自分の位置を確認するために使用します。</string>
     <key>NSLocationAlwaysAndWhenInUseUsageDescription</key>

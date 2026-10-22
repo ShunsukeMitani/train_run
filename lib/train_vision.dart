@@ -6,8 +6,10 @@ import 'package:flutter/services.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:screenshot/screenshot.dart'; 
+import 'package:image_gallery_saver/image_gallery_saver.dart'; 
 import 'api_service.dart';
-import 'othello_logic.dart'; // ★追加: オセロ判定ロジック
+import 'othello_logic.dart'; 
 
 class TrainVisionScreen extends StatefulWidget {
   final String myRole;
@@ -25,13 +27,17 @@ class TrainVisionScreen extends StatefulWidget {
 
 class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProviderStateMixin {
   late TabController _tabController;
-  late AnimationController _glowController; // ★追加: ピカピカ光るアニメーション用
+  late AnimationController _glowController; 
   
+  final ScreenshotController _screenshotController = ScreenshotController();
+  int _prevStoneCount = 0; 
+  bool _autoScreenshotEnabled = false; 
+
   List<String> _lines = [];
   Map<String, List<Map<String, dynamic>>> _stationsCache = {};
   bool _isLoading = true;
   String _currentLine = "";
-  String _myTeam = "RED"; // ★追加: 自分のチームカラー
+  String _myTeam = "RED"; 
   
   bool _isOthelloMode = false;
   bool _isBingoMode = false;
@@ -40,7 +46,6 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
   bool _isSugorokuMode = false;
   int _boardSize = 8;
   
-  // ★追加：ターン制用の変数
   bool _isTurnBased = false;
   String _currentTurnTeam = "RED";
   DateTime? _turnEndTime;
@@ -53,7 +58,7 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
   bool _showResultScreen = false;
   
   Timer? _gameTimer;
-  int _remainingSeconds = 18000; // 5時間
+  int _remainingSeconds = 18000; 
 
   final FlutterLocalNotificationsPlugin _flutterLocalNotificationsPlugin = FlutterLocalNotificationsPlugin();
 
@@ -178,7 +183,6 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
     _fetchGameData();
     _startTimer();
     
-    // ★追加: 1秒かけて光り、1秒かけて消えるループアニメーション
     _glowController = AnimationController(
       vsync: this, 
       duration: const Duration(seconds: 1)
@@ -194,6 +198,31 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
     _gameTimer?.cancel();
     _glowController.dispose();
     super.dispose();
+  }
+
+  Future<void> _captureAndSaveScreenshot() async {
+    try {
+      await Future.delayed(const Duration(milliseconds: 500)); 
+      final imageBytes = await _screenshotController.capture();
+      if (imageBytes != null) {
+        final result = await ImageGallerySaver.saveImage(
+          imageBytes, 
+          quality: 100, 
+          name: "train_vision_${DateTime.now().millisecondsSinceEpoch}"
+        );
+        if (mounted && result != null && result['isSuccess'] == true) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('📸 盤面の変化をアルバムに保存しました！', style: TextStyle(fontWeight: FontWeight.bold)), 
+              backgroundColor: Colors.amber, 
+              duration: Duration(seconds: 2)
+            )
+          );
+        }
+      }
+    } catch (e) {
+      print("Screenshot error: $e");
+    }
   }
 
   Future<void> _initNotifications() async {
@@ -300,6 +329,8 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
         if (data['turnEndTime'] != null) {
           _turnEndTime = (data['turnEndTime'] as Timestamp).toDate();
         }
+        
+        _autoScreenshotEnabled = data['settings_autoScreenshot'] ?? false;
       });
 
       if (_lines.isEmpty) {
@@ -940,88 +971,100 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
           if (v['ownerTeam'] == 'RED') red++; 
           if (v['ownerTeam'] == 'BLUE') blue++; 
         });
+
+        // ★追加: 自分がGMかどうかを判定
+        bool isGMPlayer = (widget.myRole == 'GAME MASTER' || widget.myRole == 'GM' || widget.myRole == 'developer' || widget.myRole == 'ADMIN');
+
+        int currentStones = red + blue;
+        // ★変更: GMの端末のみ、かつ設定がONの時だけスクショを保存
+        if (isGMPlayer && _autoScreenshotEnabled && _prevStoneCount > 0 && currentStones > _prevStoneCount) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+             _captureAndSaveScreenshot();
+          });
+        }
+        _prevStoneCount = currentStones; 
         
-        // ★追加: ピカピカ光らせる対象チームを決定
         String highlightTeam = _myTeam;
-        if (widget.myRole == 'GAME MASTER' || widget.myRole == 'GM' || widget.myRole == 'developer' || widget.myRole == 'ADMIN') {
-          highlightTeam = _currentTurnTeam; // GMは現在のターンのチームの置ける場所を見る
+        if (isGMPlayer) {
+          highlightTeam = _currentTurnTeam; 
         } else if (_isTurnBased && _currentTurnTeam != _myTeam) {
-          highlightTeam = ""; // ターン制の場合、自分のターンじゃない時は光らせない
+          highlightTeam = ""; 
         }
 
-        // 盤面全体から「置ける場所」のリストを抽出
         List<String> validMoves = [];
         if (highlightTeam.isNotEmpty) {
           validMoves = OthelloLogic.getValidMoves(highlightTeam, boardData, _boardSize);
         }
 
-        return Column(
-          children: [
-            Padding(
-              padding: const EdgeInsets.all(8.0), 
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceEvenly, 
-                children: [
-                  Text("RED: $red", style: const TextStyle(color: Colors.redAccent, fontSize: 20, fontWeight: FontWeight.bold)), 
-                  Text("BLUE: $blue", style: const TextStyle(color: Colors.blueAccent, fontSize: 20, fontWeight: FontWeight.bold))
-                ]
-              )
-            ), 
-            Expanded(
-              child: _buildExcelGrid(
-                rows: _boardSize, 
-                cols: _boardSize,
-                cellBuilder: (x, y) {
-                  var cell = boardData["${x}_$y"]; 
-                  String stationName = cell?['station'] ?? ""; 
-                  String? owner = cell?['ownerTeam']; 
-                  
-                  // このマスが置ける場所かどうかを判定
-                  bool isValidMove = validMoves.contains("${x}_$y");
+        return Screenshot(
+          controller: _screenshotController,
+          child: Container(
+            color: Colors.white, 
+            child: Column(
+              children: [
+                Padding(
+                  padding: const EdgeInsets.all(8.0), 
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly, 
+                    children: [
+                      Text("RED: $red", style: const TextStyle(color: Colors.redAccent, fontSize: 20, fontWeight: FontWeight.bold)), 
+                      Text("BLUE: $blue", style: const TextStyle(color: Colors.blueAccent, fontSize: 20, fontWeight: FontWeight.bold))
+                    ]
+                  )
+                ), 
+                Expanded(
+                  child: _buildExcelGrid(
+                    rows: _boardSize, 
+                    cols: _boardSize,
+                    cellBuilder: (x, y) {
+                      var cell = boardData["${x}_$y"]; 
+                      String stationName = cell?['station'] ?? ""; 
+                      String? owner = cell?['ownerTeam']; 
+                      
+                      bool isValidMove = validMoves.contains("${x}_$y");
 
-                  Widget content = Container(
-                    color: Colors.white, 
-                    alignment: Alignment.center, 
-                    child: owner != null 
-                      ? Container(
-                          width: 40, 
-                          height: 40, 
-                          decoration: BoxDecoration(color: owner == 'RED' ? Colors.red : Colors.blue, shape: BoxShape.circle), 
-                          alignment: Alignment.center, 
-                          child: Text(stationName, style: const TextStyle(fontSize: 8, color: Colors.white, fontWeight: FontWeight.bold), textAlign: TextAlign.center, overflow: TextOverflow.ellipsis, maxLines: 2)
-                        ) 
-                      : Text(stationName, style: const TextStyle(fontSize: 10, color: Colors.black), textAlign: TextAlign.center, overflow: TextOverflow.ellipsis, maxLines: 2)
-                  ); 
+                      Widget content = Container(
+                        color: Colors.white, 
+                        alignment: Alignment.center, 
+                        child: owner != null 
+                          ? Container(
+                              width: 40, 
+                              height: 40, 
+                              decoration: BoxDecoration(color: owner == 'RED' ? Colors.red : Colors.blue, shape: BoxShape.circle), 
+                              alignment: Alignment.center, 
+                              child: Text(stationName, style: const TextStyle(fontSize: 8, color: Colors.white, fontWeight: FontWeight.bold), textAlign: TextAlign.center, overflow: TextOverflow.ellipsis, maxLines: 2)
+                            ) 
+                          : Text(stationName, style: const TextStyle(fontSize: 10, color: Colors.black), textAlign: TextAlign.center, overflow: TextOverflow.ellipsis, maxLines: 2)
+                      ); 
 
-                  // ★置ける場所なら、アニメーションで光らせる！
-                  if (isValidMove) {
-                    return AnimatedBuilder(
-                      animation: _glowController,
-                      builder: (context, child) {
-                        return Container(
-                          decoration: BoxDecoration(
-                            // 枠線と影の強さが0.0〜1.0で変化してホタルのように光る
-                            border: Border.all(color: Colors.amber, width: 2 + (_glowController.value * 2)),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.amber.withOpacity(0.3 + (_glowController.value * 0.3)), 
-                                blurRadius: 5 + (_glowController.value * 10), 
-                                spreadRadius: _glowController.value * 3
-                              )
-                            ]
-                          ),
-                          child: content,
+                      if (isValidMove) {
+                        return AnimatedBuilder(
+                          animation: _glowController,
+                          builder: (context, child) {
+                            return Container(
+                              decoration: BoxDecoration(
+                                border: Border.all(color: Colors.amber, width: 2 + (_glowController.value * 2)),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: Colors.amber.withOpacity(0.3 + (_glowController.value * 0.3)), 
+                                    blurRadius: 5 + (_glowController.value * 10), 
+                                    spreadRadius: _glowController.value * 3
+                                  )
+                                ]
+                              ),
+                              child: content,
+                            );
+                          },
                         );
-                      },
-                    );
-                  }
-                  
-                  // 置けない場所は普通に描画
-                  return content;
-                },
-              ),
+                      }
+                      
+                      return content;
+                    },
+                  ),
+                ),
+              ],
             ),
-          ],
+          ),
         );
       }
     );
@@ -1186,7 +1229,6 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
                             pColor = Colors.blue; 
                           }
                           
-                          // ★変更：GM（デベロッパー）は金色の星アイコンに！
                           if (p['role'] == 'GAME MASTER' || p['role'] == 'GM' || p['role'] == 'developer' || p['role'] == 'ADMIN') { 
                             pColor = Colors.amber; 
                             pIcon = Icons.star; 
@@ -1260,7 +1302,6 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
                         tc = Colors.blue; 
                       }
                       
-                      // ★変更：GM（デベロッパー）は金色の星アイコンに！
                       if (p['role'] == 'GAME MASTER' || p['role'] == 'GM' || p['role'] == 'developer' || p['role'] == 'ADMIN') { 
                         tc = Colors.amber; 
                         ti = Icons.star; 
@@ -1344,4 +1385,4 @@ class PieChartPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
-} //完成！
+}

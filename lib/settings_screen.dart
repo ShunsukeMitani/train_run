@@ -28,6 +28,8 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
   bool _othelloStandardInit = true; 
   bool _othelloTurnBased = false;
   int _turnDurationMinutes = 10;
+  
+  bool _autoScreenshot = false; 
 
   String _selectedMode = 'A';
   final Map<String, String> _modeNames = {
@@ -48,7 +50,6 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
   @override
   void initState() {
     super.initState();
-    // ★追加: 設定画面を開いた時にFirebaseから現在の設定を読み込んで復元する
     _loadCurrentSettings();
   }
 
@@ -67,6 +68,7 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
           if (data['settings_allowSurrender'] != null) _allowSurrender = data['settings_allowSurrender'];
           if (data['allowedLines'] != null) _allowedLines = List<String>.from(data['allowedLines']);
           if (data['allowedStations'] != null) _allowedStations = List<String>.from(data['allowedStations']);
+          if (data['settings_autoScreenshot'] != null) _autoScreenshot = data['settings_autoScreenshot'];
         });
       }
     } catch (e) {
@@ -94,14 +96,12 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
     );
   }
 
-  // ★超重要：各路線から最低1駅を確実にピックアップし、全体をバランスよくシャッフルする神アルゴリズム
   Future<List<String>> _getBalancedStationList(int requiredCount) async {
     Map<String, List<String>> lineStations = {};
     Set<String> validStationsSet = _allowedStations.isNotEmpty 
         ? _allowedStations.map((s) => _normalizeStationName(s)).toSet() 
         : {};
 
-    // まず各路線の対象駅をまとめる
     for (String l in _allowedLines) {
       var sList = await TrainApiService.getStationsByLine(l);
       List<String> validForLine = [];
@@ -111,7 +111,6 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
           validForLine.add(sName);
         }
       }
-      // 同じ駅が路線内にダブって入らないよう排除
       validForLine = validForLine.toSet().toList();
       if (validForLine.isNotEmpty) {
         lineStations[l] = validForLine;
@@ -121,12 +120,10 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
     Set<String> selectedSet = {};
     List<String> remaining = [];
 
-    // 1. 【対象駅が0になる路線を防ぐ】各路線から最低1つずつ選ぶ
     for (String l in lineStations.keys) {
       var list = lineStations[l]!;
       list.shuffle();
       for(String s in list) {
-        // すでに他路線の乗換駅として選ばれていないかチェック
         if(!selectedSet.contains(s)) {
           selectedSet.add(s);
           break;
@@ -134,7 +131,6 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
       }
     }
 
-    // 2. 残りの駅を全部ひとまとめにする
     for (String l in lineStations.keys) {
       for(String s in lineStations[l]!) {
         if (!selectedSet.contains(s) && !remaining.contains(s)) {
@@ -145,18 +141,15 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
 
     List<String> selected = selectedSet.toList();
 
-    // 3. 盤面のマス目に足りない分を、残りの駅の中からランダムに補充する
     remaining.shuffle();
     int needed = requiredCount - selected.length;
     if (needed > 0) {
       selected.addAll(remaining.take(needed));
     } else if (needed < 0) {
-      // 万が一「選んだ路線の数」が「盤面のマス目」より多い場合は、泣く泣く路線を削る
       selected.shuffle();
       selected = selected.take(requiredCount).toList();
     }
 
-    // 4. 最後に全体をシャッフル（どの路線の駅が盤面のどこに配置されるか分からなくする）
     selected.shuffle();
     return selected;
   }
@@ -203,6 +196,7 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
         'settings_boardSize': _boardSize.toInt(),
         'settings_othelloTurnBased': _othelloTurnBased,
         'turnDurationMinutes': _turnDurationMinutes,
+        'settings_autoScreenshot': _autoScreenshot,
         'currentTurn': 'RED',
         'turnEndTime': firstTurnEndTime,
         'bingoCompleteCount': 0,
@@ -236,7 +230,6 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
     int size = _boardSize.toInt();
     int totalCells = size * size;
     
-    // ★変更: ビンゴも全路線から満遍なくピックアップしたリストを使う
     List<String> balancedStations = await _getBalancedStationList(totalCells);
 
     if (balancedStations.length < totalCells) {
@@ -247,7 +240,6 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
     var batch = FirebaseFirestore.instance.batch();
 
     for (var player in players.docs) {
-      // プレイヤーごとに配置をシャッフル
       List<String> stationList = List.from(balancedStations)..shuffle();
       List<Map<String, dynamic>> cardData = [];
       
@@ -272,7 +264,6 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
     int size = _boardSize.toInt();
     int totalCells = size * size;
     
-    // ★変更: バランス保証付きの神シャッフルアルゴリズムで駅を取得
     List<String> stationList = await _getBalancedStationList(totalCells);
 
     var batch = FirebaseFirestore.instance.batch();
@@ -404,7 +395,6 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
     if(mounted) showDialog(context: context, builder: (ctx) => AlertDialog(backgroundColor: Colors.grey[900], content: SizedBox(width: double.maxFinite, height: 500, child: StatefulBuilder(builder: (ctx, ss) => ListView.builder(itemCount: _allowedLines.length, itemBuilder: (c, i) => ExpansionTile(title: Text(_allowedLines[i], style: const TextStyle(color: Colors.green)), children: m[_allowedLines[i]]!.map((s) => CheckboxListTile(title: Text(s, style: const TextStyle(color: Colors.white)), value: _allowedStations.contains(s), onChanged: (v) { ss(() { if(v!) _allowedStations.add(s); else _allowedStations.remove(s); }); setState((){}); })).toList())))), actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("完了", style: TextStyle(color: Colors.blueAccent)))])); 
   }
 
-  // ★修正: 対象駅すべてからバランス良くシャッフルして再構成する
   Future<void> _shuffleOthelloBoard() async {
     if (_allowedLines.isEmpty) {
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('対象路線が設定されていません。'), backgroundColor: Colors.redAccent));
@@ -414,7 +404,6 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
     int boardSize = _boardSize.toInt(); 
     int totalCells = boardSize * boardSize;
 
-    // 神シャッフルアルゴリズムで新しく対象駅全体からピックアップ
     List<String> stationList = await _getBalancedStationList(totalCells);
 
     WriteBatch batch = FirebaseFirestore.instance.batch();
@@ -506,6 +495,15 @@ class _SettingsAppScreenState extends State<SettingsAppScreen> {
                     onChanged: (v) => setState(() => _turnDurationMinutes = v!),
                   ),
                 ),
+                
+              const Divider(color: Colors.grey),
+              SwitchListTile(
+                title: const Text("盤面変化時に自動スクショ保存", style: TextStyle(color: Colors.white)),
+                subtitle: const Text("※GMの端末（アルバム）にのみ自動保存されます", style: TextStyle(color: Colors.grey, fontSize: 12)),
+                value: _autoScreenshot,
+                activeColor: Colors.amberAccent,
+                onChanged: (v) => setState(() => _autoScreenshot = v),
+              ),
             ] else ...[
               const Text("※ゲーム開始時に全員にランダムなカードが配布されます", style: TextStyle(color: Colors.grey, fontSize: 12)),
             ],
