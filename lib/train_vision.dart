@@ -7,7 +7,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:screenshot/screenshot.dart'; 
-import 'package:image_gallery_saver/image_gallery_saver.dart'; 
+import 'package:image_gallery_saver_plus/image_gallery_saver_plus.dart'; // ★変更: 最新のPlus版に変更！
 import 'api_service.dart';
 import 'othello_logic.dart'; 
 
@@ -62,7 +62,7 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
 
   final FlutterLocalNotificationsPlugin _flutterLocalNotificationsPlugin = FlutterLocalNotificationsPlugin();
 
-  String _normalizeStationName(String name) {
+String _normalizeStationName(String name) {
     if (name == '難波' || name == '大阪難波' || name == 'ＪＲ難波' || name == '近鉄難波' || name == '南海なんば') return 'なんば';
     if (name == '大阪' || name == '大阪梅田' || name == '東梅田' || name == '西梅田') return '梅田';
     if (name == '三ノ宮' || name == '神戸三宮' || name == '阪神神戸三宮' || name == '阪急神戸三宮') return '三宮';
@@ -205,7 +205,8 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
       await Future.delayed(const Duration(milliseconds: 500)); 
       final imageBytes = await _screenshotController.capture();
       if (imageBytes != null) {
-        final result = await ImageGallerySaver.saveImage(
+        // ★変更: Plus版のメソッドを呼び出す！
+        final result = await ImageGallerySaverPlus.saveImage(
           imageBytes, 
           quality: 100, 
           name: "train_vision_${DateTime.now().millisecondsSinceEpoch}"
@@ -972,11 +973,9 @@ class _TrainVisionScreenState extends State<TrainVisionScreen> with TickerProvid
           if (v['ownerTeam'] == 'BLUE') blue++; 
         });
 
-        // ★追加: 自分がGMかどうかを判定
         bool isGMPlayer = (widget.myRole == 'GAME MASTER' || widget.myRole == 'GM' || widget.myRole == 'developer' || widget.myRole == 'ADMIN');
 
         int currentStones = red + blue;
-        // ★変更: GMの端末のみ、かつ設定がONの時だけスクショを保存
         if (isGMPlayer && _autoScreenshotEnabled && _prevStoneCount > 0 && currentStones > _prevStoneCount) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
              _captureAndSaveScreenshot();
