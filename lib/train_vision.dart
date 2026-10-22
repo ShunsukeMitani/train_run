@@ -7,7 +7,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:screenshot/screenshot.dart'; 
-import 'package:image_gallery_saver_plus/image_gallery_saver_plus.dart'; // ★変更: 最新のPlus版に変更！
+import 'package:image_gallery_saver_plus/image_gallery_saver_plus.dart'; 
 import 'api_service.dart';
 import 'othello_logic.dart'; 
 
@@ -205,7 +205,6 @@ String _normalizeStationName(String name) {
       await Future.delayed(const Duration(milliseconds: 500)); 
       final imageBytes = await _screenshotController.capture();
       if (imageBytes != null) {
-        // ★変更: Plus版のメソッドを呼び出す！
         final result = await ImageGallerySaverPlus.saveImage(
           imageBytes, 
           quality: 100, 
@@ -379,6 +378,8 @@ String _normalizeStationName(String name) {
       builder: (ctx) {
         return StatefulBuilder(
           builder: (BuildContext context, StateSetter setModalState) {
+            
+            // ★乗り換えペナルティ計算付きのダイクストラ法（SPFA）に進化
             void calculateRoute() {
               if (startStation.isEmpty || endStation.isEmpty) return;
               String start = _normalizeStationName(startStation);
@@ -388,7 +389,10 @@ String _normalizeStationName(String name) {
                 return;
               }
 
-              Map<String, List<Map<String, String>>> graph = {};
+              Map<String, List<String>> stationLines = {};
+              Map<String, List<Map<String, String>>> lineGraph = {};
+
+              // 全路線のグラフを構築
               for (String line in _stationsCache.keys) {
                 List<Map<String, dynamic>> stations = _stationsCache[line]!;
                 if (stations.isEmpty) continue;
@@ -397,81 +401,157 @@ String _normalizeStationName(String name) {
 
                 for (int i = 0; i < stations.length; i++) {
                   String current = _normalizeStationName(stations[i]['name']);
-                  if (!graph.containsKey(current)) graph[current] = [];
+                  if (!stationLines.containsKey(current)) stationLines[current] = [];
+                  if (!stationLines[current]!.contains(line)) stationLines[current]!.add(line);
+
+                  String nodeKey = "$current|$line";
+                  if (!lineGraph.containsKey(nodeKey)) lineGraph[nodeKey] = [];
+
                   if (i > 0) {
                     String prev = _normalizeStationName(stations[i - 1]['name']);
-                    graph[current]!.add({'to': prev, 'line': line, 'dir': firstStation});
+                    lineGraph[nodeKey]!.add({'to': prev, 'line': line, 'dir': firstStation});
                   }
                   if (i < stations.length - 1) {
                     String next = _normalizeStationName(stations[i + 1]['name']);
-                    graph[current]!.add({'to': next, 'line': line, 'dir': lastStation});
+                    lineGraph[nodeKey]!.add({'to': next, 'line': line, 'dir': lastStation});
                   }
                 }
               }
 
-              if (!graph.containsKey(start) || !graph.containsKey(end)) {
+              if (!stationLines.containsKey(start) || !stationLines.containsKey(end)) {
                 setModalState(() { routeResult = ["入力された駅間の経路が見つかりません"]; });
                 return;
               }
 
-              Queue<List<Map<String, String>>> queue = Queue();
-              Set<String> visited = {start};
+              // 探索用変数
+              Map<String, int> costs = {};
+              Map<String, Map<String, String>?> previous = {};
+              Queue<String> queue = Queue();
+              Map<String, bool> inQueue = {};
 
-              for (var edge in graph[start]!) {
-                queue.add([edge]);
-                visited.add(edge['to']!);
+              for (String s in stationLines.keys) {
+                for (String l in stationLines[s]!) {
+                  costs["$s|$l"] = 99999999;
+                  inQueue["$s|$l"] = false;
+                }
               }
 
-              List<Map<String, String>>? shortestPath;
+              for (String l in stationLines[start]!) {
+                String key = "$start|$l";
+                costs[key] = 0;
+                queue.add(key);
+                inQueue[key] = true;
+              }
 
+              // 探索ループ
               while (queue.isNotEmpty) {
-                var path = queue.removeFirst();
-                String current = path.last['to']!;
+                String currentKey = queue.removeFirst();
+                inQueue[currentKey] = false;
+                int currentCost = costs[currentKey]!;
 
-                if (current == end) {
-                  shortestPath = path;
-                  break;
+                List<String> parts = currentKey.split('|');
+                String currentStation = parts[0];
+                String currentLine = parts[1];
+
+                // 1. 駅の移動 (コスト: 10)
+                for (var edge in lineGraph[currentKey]!) {
+                  String nextStation = edge['to']!;
+                  String nextKey = "$nextStation|$currentLine";
+                  int newCost = currentCost + 10;
+                  if (newCost < costs[nextKey]!) {
+                    costs[nextKey] = newCost;
+                    previous[nextKey] = {'station': currentStation, 'line': currentLine, 'dir': edge['dir']!};
+                    if (inQueue[nextKey] != true) {
+                      queue.add(nextKey);
+                      inQueue[nextKey] = true;
+                    }
+                  }
                 }
 
-                for (var edge in graph[current]!) {
-                  if (!visited.contains(edge['to'])) {
-                    visited.add(edge['to']!);
-                    List<Map<String, String>> newPath = List.from(path)..add(edge);
-                    queue.add(newPath);
+                // 2. 別の路線への乗り換え (コスト: 10000)
+                for (String nextLine in stationLines[currentStation]!) {
+                  if (nextLine != currentLine) {
+                    String nextKey = "$currentStation|$nextLine";
+                    int newCost = currentCost + 10000;
+                    if (newCost < costs[nextKey]!) {
+                      costs[nextKey] = newCost;
+                      previous[nextKey] = {'station': currentStation, 'line': currentLine, 'dir': 'TRANSFER'};
+                      if (inQueue[nextKey] != true) {
+                        queue.add(nextKey);
+                        inQueue[nextKey] = true;
+                      }
+                    }
                   }
                 }
               }
 
-              if (shortestPath == null) {
+              // ゴール到達確認
+              String? bestEndKey;
+              int minCost = 99999999;
+              for (String l in stationLines[end]!) {
+                String key = "$end|$l";
+                if (costs[key]! < minCost) {
+                  minCost = costs[key]!;
+                  bestEndKey = key;
+                }
+              }
+
+              if (bestEndKey == null || minCost >= 99999999) {
                 setModalState(() { routeResult = ["ルートが見つかりませんでした"]; });
                 return;
               }
 
+              // 経路の復元
+              List<Map<String, String>> path = [];
+              String? curr = bestEndKey;
+              while (curr != null) {
+                var prevNode = previous[curr];
+                if (prevNode == null) break;
+
+                List<String> parts = curr.split('|');
+                String currStation = parts[0];
+                String currLine = parts[1];
+
+                if (prevNode['dir'] == 'TRANSFER') {
+                  path.insert(0, {'type': 'TRANSFER', 'station': currStation, 'fromLine': prevNode['line']!, 'toLine': currLine});
+                } else {
+                  path.insert(0, {'type': 'MOVE', 'fromStation': prevNode['station']!, 'toStation': currStation, 'line': currLine, 'dir': prevNode['dir']!});
+                }
+                curr = "${prevNode['station']}|${prevNode['line']}";
+              }
+
+              // UI表示用に整形
               List<String> result = [];
               result.add("🟢 出発: $startStation");
 
-              String currentLine = shortestPath.first['line']!;
-              String currentDir = shortestPath.first['dir']!;
-              result.add("🚆 乗車: $currentLine ($currentDir行)");
-
+              String currentLineDisplay = "";
               int stationCount = 0;
-              for (int i = 0; i < shortestPath.length; i++) {
-                var step = shortestPath[i];
-                if (step['line'] != currentLine) {
-                  result.add("↓ ($stationCount駅通過)");
-                  String transferStation = shortestPath[i - 1]['to']!;
-                  result.add("🔄 乗換: $transferStation");
 
-                  currentLine = step['line']!;
-                  currentDir = step['dir']!;
-                  result.add("🚆 乗車: $currentLine ($currentDir行)");
-                  stationCount = 1;
-                } else {
+              for (int i = 0; i < path.length; i++) {
+                var step = path[i];
+                if (step['type'] == 'MOVE') {
+                  if (currentLineDisplay != step['line']) {
+                    if (stationCount > 0) {
+                      result.add("↓ ($stationCount駅通過)");
+                      stationCount = 0;
+                    }
+                    currentLineDisplay = step['line']!;
+                    result.add("🚆 乗車: $currentLineDisplay (${step['dir']}行)");
+                  }
                   stationCount++;
+                } else if (step['type'] == 'TRANSFER') {
+                  if (stationCount > 0) {
+                    result.add("↓ ($stationCount駅通過)");
+                    stationCount = 0;
+                  }
+                  result.add("🔄 乗換: ${step['station']} (${step['fromLine']} → ${step['toLine']})");
+                  currentLineDisplay = step['toLine']!;
                 }
               }
 
-              result.add("↓ ($stationCount駅通過)");
+              if (stationCount > 0) {
+                result.add("↓ ($stationCount駅通過)");
+              }
               result.add("🏁 到着: $endStation");
 
               setModalState(() { routeResult = result; });
